@@ -50,8 +50,17 @@ VPNGATE_MIRROR = os.environ.get(
     "VPNGATE_MIRROR",
     "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/json/data.json",
 )
-# 已部署的 Cloudflare Worker 检测接口 (GET /check?proxyip=host:port, 实测确认)
-WORKER_CHECK_URL = os.environ.get("CHECK_WORKER", "https://autumn-sea-4d92.liuy90866.workers.dev/check?sstp=vpn:vpn@")
+# 已部署的 Cloudflare Worker 检测接口。主域失败时回退 workers.dev 原地址。
+WORKER_CHECK_URLS = [
+    value
+    for value in (
+        os.environ.get("CHECK_WORKER"),
+        "https://autumn-sea-4d92.liuy90866.workers.dev/check?sstp=vpn:vpn@",
+    )
+    if value
+]
+if not WORKER_CHECK_URLS:
+    die("CHECK_WORKER 为空且没有默认 Worker 地址")
 CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "32")))   # 与 Worker 网页端一致的并发模型
 CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "90"))          # 单请求客户端超时 (秒)
 MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))         # 0=不限; 本地测试可设小值
@@ -310,7 +319,6 @@ def classify_network(host, exit_org, is_datacenter=None):
 def check_one(node, session):
     """调用 Worker 检测单节点。返回节点+检测结果的合并 dict。
     单节点失败 (网络错误/非 200/坏 JSON) 不会抛出, 统一记 success=False。"""
-    url = WORKER_CHECK_URL + quote(f"{node['host']}:{node['port']}", safe="")
     out = dict(node)
     out["protocol"] = "sstp"
     out["link"] = f"sstp://vpn:vpn@{node['host']}:{node['port']}"
@@ -318,12 +326,23 @@ def check_one(node, session):
     out["checked_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     out["exit"] = None
     out["residential"] = "unknown"
+    errors = []
     try:
-        r = session.get(url, timeout=CHECK_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (gate-checker)"})
-        if r.status_code != 200:
-            out["error"] = f"HTTP {r.status_code}"
+        for worker_url in WORKER_CHECK_URLS:
+            url = worker_url + quote(f"{node['host']}:{node['port']}", safe="")
+            try:
+                r = session.get(url, timeout=CHECK_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (gate-checker)"})
+                if r.status_code != 200:
+                    errors.append(f"{worker_url} -> HTTP {r.status_code}")
+                    continue
+                break
+            except Exception as exc:
+                errors.append(f"{worker_url} -> {type(exc).__name__}: {exc}")
+        else:
+            out["error"] = "; ".join(errors)
             out["worker_error"] = True
             return out
+
         j = r.json()
         ok = bool(j.get("success"))
         out["success"] = ok
@@ -399,7 +418,7 @@ def build_outputs(results, raw_count, sstp_count, source):
     data = {
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         "source": source,
-        "worker": WORKER_CHECK_URL,
+        "worker": WORKER_CHECK_URLS[0],
         "stats": stats,
         "countries": by_country,
         "available": available,
