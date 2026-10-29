@@ -34,6 +34,13 @@ from urllib.parse import quote, urlparse
 
 import requests
 
+
+def env_flag(name, default="1"):
+    """Read a boolean environment variable with a conservative default."""
+    value = os.environ.get(name, default).strip().lower()
+    return value not in ("0", "false", "no", "off", "disabled")
+
+
 # 保证日志在任何控制台编码下都能输出 (Windows GBK 控制台不会崩)
 for _stream in (sys.stdout, sys.stderr):
     try:
@@ -89,7 +96,7 @@ HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "60"))              # 拉取�
 
 # 全球节点池 (VPN Gate 滚动池镜像): 只取 Cloudflare Worker 预探测可达的节点
 POOL_ENABLED = os.environ.get("POOL_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
-POOL_PER_COUNTRY = max(0, int(os.environ.get("POOL_PER_COUNTRY", "10")))
+POOL_PER_COUNTRY = max(0, int(os.environ.get("POOL_PER_COUNTRY", "120")))
 POOL_URL = os.environ.get(
     "POOL_URL",
     "https://cdn.jsdelivr.net/gh/GeorgeXie2333/vpngate-list-mirror@latest/pool/servers.json",
@@ -105,9 +112,29 @@ MAX_LATENCY_MS = int(os.environ.get("MAX_LATENCY_MS", "400"))
 # 优选入口只取最快的 N 个 (0 = 不限)
 EDGE_MAX_ENTRIES = max(0, int(os.environ.get("EDGE_MAX_ENTRIES", "300")))
 # 最终节点数上限, 按延迟从快到慢保留 (0 = 不限)
-MAX_NODES = max(0, int(os.environ.get("MAX_NODES", "120")))
+MAX_NODES = max(0, int(os.environ.get("MAX_NODES", "150")))
 # 优选入口域名自身的延迟上限 (CSV 的「延迟(ms)」列); 0 = 不限制
 MAX_ENTRY_LATENCY_MS = int(os.environ.get("MAX_ENTRY_LATENCY_MS", "400"))
+
+# 严格住宅筛选: 只接受 Worker 明确返回 exit.is_datacenter=false 的节点。
+# Worker 无法识别 (None) 的节点不会冒充住宅节点。
+REQUIRE_RESIDENTIAL = env_flag("REQUIRE_RESIDENTIAL", "1")
+# 家庭宽带通常由 ISP 持有; business/government 网络不当作住宅候选。
+REQUIRE_ISP_ASN = env_flag("REQUIRE_ISP_ASN", "1")
+
+# 出口 IP 二次纯净度检测 (ip-api.com batch, 免费接口每批最多 100 个 IP)。
+# proxy=false 默认不强制，因为 VPN Gate 出口本身通常会被情报库标成 proxy/VPN；
+# hosting=false 和 mobile=false 用来尽量排除机房与移动网络。
+PURITY_ENABLED = env_flag("PURITY_ENABLED", "1")
+PURITY_REQUIRE_HOSTING_FALSE = env_flag("PURITY_REQUIRE_HOSTING_FALSE", "1")
+PURITY_REQUIRE_PROXY_FALSE = env_flag("PURITY_REQUIRE_PROXY_FALSE", "0")
+PURITY_REQUIRE_NOT_MOBILE = env_flag("PURITY_REQUIRE_NOT_MOBILE", "1")
+PURITY_FAIL_OPEN = env_flag("PURITY_FAIL_OPEN", "1")
+PURITY_URL = os.environ.get(
+    "PURITY_URL",
+    "http://ip-api.com/batch?fields=status,message,countryCode,isp,org,as,mobile,proxy,hosting,query",
+)
+PURITY_BATCH_SIZE = max(1, min(100, int(os.environ.get("PURITY_BATCH_SIZE", "100"))))
 
 PUBLIC_DIR = os.environ.get("PUBLIC_DIR", os.path.join(REPO_DIR, "public"))
 TEMPLATE_HTML = os.path.join(REPO_DIR, "web", "index.html")
@@ -590,6 +617,97 @@ def check_all(nodes, session):
     return results
 
 
+def check_exit_purity(results, session):
+    """用 ip-api 批量补充出口 IP 情报, 供住宅/纯净度筛选。
+
+    这个接口只能识别 hosting/proxy/mobile, 不能证明 IP 是"家庭宽带"
+    或"原生 IP"。因此网页会把这些字段作为候选依据, 不会写成保证。
+    """
+    if not PURITY_ENABLED:
+        log("PURITY", "出口 IP 纯净度检测已关闭")
+        return
+
+    nodes_by_ip = {}
+    for node in results:
+        if not node.get("success"):
+            continue
+        ip = (node.get("exit") or {}).get("ip")
+        if ip:
+            nodes_by_ip.setdefault(str(ip), []).append(node)
+
+    if not nodes_by_ip:
+        log("PURITY", "没有可检测的出口 IP")
+        return
+
+    ips = list(nodes_by_ip)
+    purity_by_ip = {}
+    failed_batches = 0
+    for start in range(0, len(ips), PURITY_BATCH_SIZE):
+        batch = ips[start:start + PURITY_BATCH_SIZE]
+        try:
+            resp = session.post(
+                PURITY_URL,
+                json=batch,
+                timeout=HTTP_TIMEOUT,
+                headers={"User-Agent": "Mozilla/5.0 (gate-checker)"},
+            )
+            resp.raise_for_status()
+            rows = resp.json()
+            if not isinstance(rows, list):
+                raise ValueError("response is not a list")
+        except Exception as exc:
+            failed_batches += 1
+            log("PURITY", f"批次 {start // PURITY_BATCH_SIZE + 1} 检测失败: {exc}")
+            continue
+
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            ip = row.get("query")
+            if not ip:
+                continue
+            purity_by_ip[str(ip)] = {
+                "status": row.get("status"),
+                "country_code": row.get("countryCode"),
+                "isp": row.get("isp"),
+                "org": row.get("org"),
+                "asn": row.get("as"),
+                "mobile": row.get("mobile"),
+                "proxy": row.get("proxy"),
+                "hosting": row.get("hosting"),
+            }
+
+    passed = failed = unknown = 0
+    for ip, nodes in nodes_by_ip.items():
+        purity = purity_by_ip.get(ip)
+        if not purity or purity.get("status") != "success":
+            purity_pass = None
+            unknown += len(nodes)
+        else:
+            checks = []
+            if PURITY_REQUIRE_HOSTING_FALSE:
+                checks.append(purity.get("hosting") is False)
+            if PURITY_REQUIRE_PROXY_FALSE:
+                checks.append(purity.get("proxy") is False)
+            if PURITY_REQUIRE_NOT_MOBILE:
+                checks.append(purity.get("mobile") is False)
+            purity_pass = all(checks) if checks else True
+            if purity_pass:
+                passed += len(nodes)
+            else:
+                failed += len(nodes)
+
+        for node in nodes:
+            node["purity"] = purity
+            node["purity_pass"] = purity_pass
+
+    log(
+        "PURITY",
+        f"出口 IP 二次检测: 通过 {passed}, 剔除 {failed}, 未知 {unknown}"
+        + (f", 失败批次 {failed_batches}" if failed_batches else ""),
+    )
+
+
 # ---------------------------------------------------------------------------
 # 第 4 步: 生成网页数据
 # ---------------------------------------------------------------------------
@@ -629,11 +747,29 @@ def build_outputs(results, raw_count, sstp_count, source):
             node["latency_ms"] = min(latencies)
 
     available, slow = [], 0
+    residential_rejected = asn_type_rejected = purity_rejected = purity_unknown = 0
     for r in success:
         lat = _num(r.get("latency_ms"))
         if MAX_LATENCY_MS > 0 and entry_known and (lat is None or lat > MAX_LATENCY_MS):
             slow += 1
             continue
+        exit_info = r.get("exit") or {}
+        if REQUIRE_RESIDENTIAL and exit_info.get("is_datacenter") is not False:
+            residential_rejected += 1
+            continue
+        if REQUIRE_ISP_ASN and str(exit_info.get("type") or "").lower() != "isp":
+            asn_type_rejected += 1
+            continue
+        if PURITY_ENABLED:
+            purity_pass = r.get("purity_pass")
+            if purity_pass is False:
+                purity_rejected += 1
+                continue
+            if purity_pass is None:
+                purity_unknown += 1
+                if not PURITY_FAIL_OPEN:
+                    purity_rejected += 1
+                    continue
         available.append(r)
 
     trimmed = 0
@@ -660,11 +796,30 @@ def build_outputs(results, raw_count, sstp_count, source):
         "countries": len(countries),
         "residential_est": sum(1 for n in available if n["residential"] == "residential"),
         "datacenter_est": sum(1 for n in available if n["residential"] == "datacenter"),
+        "residential_verified": sum(
+            1 for n in available if (n.get("exit") or {}).get("is_datacenter") is False
+        ),
         "slow_filtered": slow,
+        "residential_filtered": residential_rejected,
+        "asn_type_filtered": asn_type_rejected,
+        "purity_filtered": purity_rejected,
+        "purity_unknown": purity_unknown,
         "trimmed": trimmed,
         "max_latency_ms": MAX_LATENCY_MS,
         "max_nodes": MAX_NODES,
         "latency_metric": "entry" if entry_known else "handshake",
+        "latency_note": (
+            "latency_ms = 本地/GitHub Runner 到 Cloudflare 优选入口的实测延迟，"
+            "不是 SSTP 整段链路延迟；handshake_ms = Worker 的 SSTP 握手耗时，也不等于 ping。"
+        ),
+        "residential_note": (
+            "住宅候选 = Worker 出口 IP 情报 is_datacenter=false 且 ASN 类型为 isp；"
+            "VPN Gate 无法保证家庭宽带或原生 IP。"
+        ),
+        "purity_note": (
+            "purity 来自 ip-api：默认要求 hosting=false 且 mobile=false；"
+            "proxy 仅展示、不强制，因为 VPN Gate 出口常被标为 proxy/VPN。"
+        ),
     }
 
     by_country = {}
@@ -1139,8 +1294,13 @@ def build_hosts_text(data):
         f"# 固定地址: {HOSTS_URL}",
         "# 每行 = 入口地址#名字$sstp://vpn:vpn@节点:端口",
         f"# 入口域名 {len(edge)} 个 (bestcf CSV 优先, 按延迟排序), 每个节点 {copies} 个入口",
-        f"# 延迟 = 入口域名实测延迟, 上限 {MAX_LATENCY_MS}ms (握手耗时见 data.json 的 handshake_ms)" if MAX_LATENCY_MS > 0 else "# 延迟 = 入口域名实测延迟 (不限)",
-        "# 名字 = 国家-住宅/机房-编号, 直接区分住宅与机房",
+        (
+            f"# 延迟 = 到 Cloudflare 入口的实测延迟, 上限 {MAX_LATENCY_MS}ms (不是 SSTP 整段延迟)"
+            if MAX_LATENCY_MS > 0
+            else "# 延迟 = 到 Cloudflare 入口的实测延迟 (不限; 不是 SSTP 整段延迟)"
+        ),
+        "# 名字 = 国家-住宅候选/机房-编号; 住宅候选由出口 IP 情报判定",
+        "# 注意: VPN Gate 无法保证家庭宽带/原生 IP; 清单不把候选写成保证",
         "# 名字固定; 只有 $sstp:// 后面的节点地址每 30 分钟自动更换",
         "# 账号密码固定 vpn:vpn ; 节点端口必须保留",
         "# ========================================================",
@@ -1246,6 +1406,8 @@ def build_sub_text(data):
         f"# 节点域名: {EDT_DOMAIN} (传输 ws / TLS / fingerprint {EDT_FINGERPRINT})",
         "# 名字固定; $sstp:// 链式代理(编码在 path)每 30 分钟自动更换",
         "# 账号密码固定 vpn:vpn ; 节点端口已编码进 path",
+        "# 延迟说明: data.json 的 latency_ms 是入口延迟, 不是 SSTP 整段链路延迟",
+        "# IP 说明: VPN Gate 出口无法保证家庭宽带/原生 IP, 仅做住宅候选筛选",
         "# ========================================================",
     ]
     ordered = sorted(
@@ -1373,12 +1535,38 @@ def main():
     if uniq and not success and len(worker_errors) == len(uniq):
         die("Worker 全部请求异常, 检测服务不可用 — 本次运行判定失败 (不生成空结果)")
 
+    # 3.5) 出口 IP 二次纯净度检测 + 住宅筛选
+    check_exit_purity(results, session)
+
     # 4) 结果 + 网页
     data = build_outputs(results, raw_count, sstp_count, source)
     if MAX_LATENCY_MS > 0:
         log("RESULT", f"延迟过滤: ≤ {MAX_LATENCY_MS}ms 保留, 丢弃 {data['stats']['slow_filtered']} 个")
+    if REQUIRE_RESIDENTIAL:
+        log(
+            "RESULT",
+            f"住宅验证: exit.is_datacenter=false 保留, "
+            f"丢弃 {data['stats']['residential_filtered']} 个",
+        )
+    if REQUIRE_ISP_ASN:
+        log(
+            "RESULT",
+            f"ASN 类型过滤: 只保留 isp, 丢弃 {data['stats']['asn_type_filtered']} 个",
+        )
+    if PURITY_ENABLED:
+        log(
+            "RESULT",
+            f"纯净度过滤: 丢弃 {data['stats']['purity_filtered']} 个, "
+            f"情报未知 {data['stats']['purity_unknown']} 个",
+        )
     if data["stats"]["trimmed"]:
         log("RESULT", f"节点数超过 {MAX_NODES}, 只保留最快的 {MAX_NODES} 个 (丢弃 {data['stats']['trimmed']} 个)")
+    elif MAX_NODES > 0 and data["stats"]["success"] < MAX_NODES:
+        log(
+            "RESULT",
+            f"严格筛选后只有 {data['stats']['success']} 个节点 (目标 {MAX_NODES}); "
+            "没有用未验证节点凑数",
+        )
     log("RESULT", f"可用节点: {data['stats']['success']}")
     log("RESULT", f"国家数量: {data['stats']['countries']}")
 
