@@ -89,7 +89,7 @@ HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "60"))              # 拉取�
 
 # 全球节点池 (VPN Gate 滚动池镜像): 只取 Cloudflare Worker 预探测可达的节点
 POOL_ENABLED = os.environ.get("POOL_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
-POOL_PER_COUNTRY = max(0, int(os.environ.get("POOL_PER_COUNTRY", "8")))
+POOL_PER_COUNTRY = max(0, int(os.environ.get("POOL_PER_COUNTRY", "10")))
 POOL_URL = os.environ.get(
     "POOL_URL",
     "https://cdn.jsdelivr.net/gh/GeorgeXie2333/vpngate-list-mirror@latest/pool/servers.json",
@@ -99,15 +99,15 @@ POOL_FALLBACK_URL = os.environ.get(
     "https://raw.githubusercontent.com/GeorgeXie2333/vpngate-list-mirror/main/pool/servers.json",
 )
 
-# 节点延迟 = 优选入口域名的实测延迟 (bestcf CSV 的「延迟(ms)」列), 默认只保留 ≤300ms。
+# 节点延迟 = 优选入口域名的实测延迟 (CSV 的「延迟(ms)」列), 默认只保留 ≤400ms。
 # Worker 返回的 SSTP 握手耗时另存为 handshake_ms, 不参与过滤。
-MAX_LATENCY_MS = int(os.environ.get("MAX_LATENCY_MS", "300"))
+MAX_LATENCY_MS = int(os.environ.get("MAX_LATENCY_MS", "400"))
 # 优选入口只取最快的 N 个 (0 = 不限)
 EDGE_MAX_ENTRIES = max(0, int(os.environ.get("EDGE_MAX_ENTRIES", "300")))
 # 最终节点数上限, 按延迟从快到慢保留 (0 = 不限)
-MAX_NODES = max(0, int(os.environ.get("MAX_NODES", "300")))
-# 优选入口域名自身的延迟上限 (bestcf CSV 的「延迟(ms)」列); 0 = 不限制
-MAX_ENTRY_LATENCY_MS = int(os.environ.get("MAX_ENTRY_LATENCY_MS", "300"))
+MAX_NODES = max(0, int(os.environ.get("MAX_NODES", "120")))
+# 优选入口域名自身的延迟上限 (CSV 的「延迟(ms)」列); 0 = 不限制
+MAX_ENTRY_LATENCY_MS = int(os.environ.get("MAX_ENTRY_LATENCY_MS", "400"))
 
 PUBLIC_DIR = os.environ.get("PUBLIC_DIR", os.path.join(REPO_DIR, "public"))
 TEMPLATE_HTML = os.path.join(REPO_DIR, "web", "index.html")
@@ -1120,7 +1120,7 @@ if EDGE_CSV_HOSTS:
     EDGE_HOSTS = _merged
 
 # 每个 SSTP 节点生成几个入口行 (1 = 旧行为; 数字越大清单行数越多)
-EDGE_COPIES = max(1, int(os.environ.get("EDGE_COPIES", "3")))
+EDGE_COPIES = max(1, int(os.environ.get("EDGE_COPIES", "1")))
 
 HOSTS_URL = os.environ.get("HOSTS_URL", f"{PAGES_BASE}/hosts.txt")
 
