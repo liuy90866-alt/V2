@@ -38,6 +38,11 @@ jobs:
           CHECK_WORKER: "https://autumn-sea-4d92.liuy90866.workers.dev/check?sstp=vpn:vpn@"
           CHECK_CONCURRENCY: "32"
           CHECK_TIMEOUT: "90"
+          # 每个 SSTP 节点生成几个入口行 (3 = 清单行数约 3 倍; 调到 12 可把 CSV 入口全用上)
+          EDGE_COPIES: "3"
+          # 额外 SSTP 节点源 (可选, 逗号分隔的 URL 或仓库内文件; 每行一个 host:port)
+          # 实测这份清单的 443 端口节点在你的 Worker 上通过率很低, 需要时再打开:
+          # EXTRA_SSTP: "https://raw.githubusercontent.com/Delta-Kronecker/Vpn-Gate/main/sstp_hosts.txt"
 
       - name: Ensure GitHub Pages is enabled (one-time auto setup)
         run: |
