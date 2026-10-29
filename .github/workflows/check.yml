@@ -38,22 +38,24 @@ jobs:
           CHECK_WORKER: "https://autumn-sea-4d92.liuy90866.workers.dev/check?sstp=vpn:vpn@"
           CHECK_CONCURRENCY: "32"
           CHECK_TIMEOUT: "90"
-          # 每个 SSTP 节点生成几个入口行 (3 = 清单行数约 3 倍; 调到 12 可把 CSV 入口全用上)
-          EDGE_COPIES: "3"
+          # 每个 SSTP 节点生成几个入口行 (1 = 一行一个节点, 最接近手动维护)
+          EDGE_COPIES: "1"
           # 额外 SSTP 节点源 (可选, 逗号分隔的 URL 或仓库内文件; 每行一个 host:port)
           # 实测这份清单的 443 端口节点在你的 Worker 上通过率很低, 需要时再打开:
           # EXTRA_SSTP: "https://raw.githubusercontent.com/Delta-Kronecker/Vpn-Gate/main/sstp_hosts.txt"
           # 全球节点池: 自动从 VPN Gate 滚动池取多国节点 (只取 Cloudflare 预探测可达的)
           POOL_ENABLED: "1"
-          POOL_PER_COUNTRY: "8"
-          # 优选入口域名自身的延迟上限 (bestcf CSV 的「延迟(ms)」列)
-          MAX_ENTRY_LATENCY_MS: "300"
-          # 节点延迟按优选入口域名的实测延迟计算, 只保留 ≤ 300ms
-          MAX_LATENCY_MS: "300"
+          POOL_PER_COUNTRY: "10"
+          # 只使用实测延迟 ≤400ms 的入口清单 (76 个 v2rayN 实测 + 44 个本地 TLS 实测)
+          EDGE_CSV: "entries-final-120.csv"
+          # 优选入口域名自身的延迟上限
+          MAX_ENTRY_LATENCY_MS: "400"
+          # 节点延迟按入口实测延迟计算, 只保留 ≤ 400ms
+          MAX_LATENCY_MS: "400"
           # 优选入口只取最快的 300 个
           EDGE_MAX_ENTRIES: "300"
           # 最终节点数上限 (按延迟从快到慢保留)
-          MAX_NODES: "300"
+          MAX_NODES: "120"
 
       - name: Ensure GitHub Pages is enabled (one-time auto setup)
         run: |
