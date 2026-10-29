@@ -99,6 +99,16 @@ POOL_FALLBACK_URL = os.environ.get(
     "https://raw.githubusercontent.com/GeorgeXie2333/vpngate-list-mirror/main/pool/servers.json",
 )
 
+# 节点延迟 = 优选入口域名的实测延迟 (bestcf CSV 的「延迟(ms)」列), 默认只保留 ≤300ms。
+# Worker 返回的 SSTP 握手耗时另存为 handshake_ms, 不参与过滤。
+MAX_LATENCY_MS = int(os.environ.get("MAX_LATENCY_MS", "300"))
+# 优选入口只取最快的 N 个 (0 = 不限)
+EDGE_MAX_ENTRIES = max(0, int(os.environ.get("EDGE_MAX_ENTRIES", "300")))
+# 最终节点数上限, 按延迟从快到慢保留 (0 = 不限)
+MAX_NODES = max(0, int(os.environ.get("MAX_NODES", "300")))
+# 优选入口域名自身的延迟上限 (bestcf CSV 的「延迟(ms)」列); 0 = 不限制
+MAX_ENTRY_LATENCY_MS = int(os.environ.get("MAX_ENTRY_LATENCY_MS", "300"))
+
 PUBLIC_DIR = os.environ.get("PUBLIC_DIR", os.path.join(REPO_DIR, "public"))
 TEMPLATE_HTML = os.path.join(REPO_DIR, "web", "index.html")
 
@@ -584,7 +594,56 @@ def check_all(nodes, session):
 # 第 4 步: 生成网页数据
 # ---------------------------------------------------------------------------
 def build_outputs(results, raw_count, sstp_count, source):
-    available = [r for r in results if r.get("success")]
+    def _num(value):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    success = [r for r in results if r.get("success")]
+
+    # 给每个节点分配优选入口域名 (hosts.txt 里同一节点会用到这几行)。
+    # 页面/清单里的「延迟」改用入口域名的实测延迟 (bestcf CSV 的 延迟(ms)),
+    # Worker 的 SSTP 握手耗时单独存到 handshake_ms。
+    edge = EDGE_HOSTS or [f"{EDT_DOMAIN}:443"]
+    if EDGE_LATENCY:
+        measured = sorted((e for e in edge if e in EDGE_LATENCY), key=lambda e: EDGE_LATENCY[e])
+        if EDGE_MAX_ENTRIES > 0:
+            measured = measured[:EDGE_MAX_ENTRIES]
+        if measured:
+            edge = measured  # 只用有实测延迟的入口, 保证每个节点延迟都能算出来
+    copies = max(1, min(EDGE_COPIES, len(edge)))
+    entry_known = bool(EDGE_LATENCY)
+    idx = 0
+    for node in sorted(success, key=lambda x: (str(x.get("country_code") or "?"), str(x.get("host") or ""))):
+        picks = []
+        for _ in range(copies):
+            picks.append(edge[idx % len(edge)])
+            idx += 1
+        latencies = [EDGE_LATENCY[e] for e in picks if EDGE_LATENCY.get(e)]
+        node["entries"] = picks
+        node["entry"] = picks[0]
+        node["entry_latency_ms"] = min(latencies) if latencies else None
+        node["handshake_ms"] = node.get("latency_ms")
+        if latencies:
+            node["latency_ms"] = min(latencies)
+
+    available, slow = [], 0
+    for r in success:
+        lat = _num(r.get("latency_ms"))
+        if MAX_LATENCY_MS > 0 and entry_known and (lat is None or lat > MAX_LATENCY_MS):
+            slow += 1
+            continue
+        available.append(r)
+
+    trimmed = 0
+    if MAX_NODES > 0 and len(available) > MAX_NODES:
+        available.sort(
+            key=lambda n: (n.get("latency_ms") is None, n.get("latency_ms") or 0, n.get("host") or "")
+        )
+        trimmed = len(available) - MAX_NODES
+        available = available[:MAX_NODES]
+
     countries = {}
     for n in available:
         exit_info = n.get("exit") or {}
@@ -597,10 +656,15 @@ def build_outputs(results, raw_count, sstp_count, source):
         "sstp_nodes": sstp_count,
         "checked": len(results),
         "success": len(available),
-        "failed": len(results) - len(available),
+        "failed": len(results) - len(success),
         "countries": len(countries),
         "residential_est": sum(1 for n in available if n["residential"] == "residential"),
         "datacenter_est": sum(1 for n in available if n["residential"] == "datacenter"),
+        "slow_filtered": slow,
+        "trimmed": trimmed,
+        "max_latency_ms": MAX_LATENCY_MS,
+        "max_nodes": MAX_NODES,
+        "latency_metric": "entry" if entry_known else "handshake",
     }
 
     by_country = {}
@@ -969,52 +1033,80 @@ edge_hosts_raw = os.environ.get(
 )
 EDGE_HOSTS = [h.strip() for h in edge_hosts_raw.split(",") if h.strip()]
 
+# 入口域名 -> 实测延迟(ms); 纯文本清单没有延迟数据, 这里就没有对应项
+EDGE_LATENCY = {}
+
 
 def _load_edge_csv():
-    """读取 bestcf 结果 CSV 里的「优选域名」, 按延迟升序返回 (去重)。
-    EDGE_CSV 可传文件路径或 URL, 多个用逗号分隔; 不传则自动找仓库里的 bestcf*.csv。"""
+    """读取优选入口域名清单 (去重, 延迟小的排前面)。
+    EDGE_CSV 可传文件路径或 URL, 多个用逗号分隔; 不传则自动找仓库里的
+    bestcf*.csv / entries*.txt / edge*.txt。CSV 按「优选域名」列解析,
+    纯文本则每行一个 host:port。"""
     spec = os.environ.get("EDGE_CSV", "").strip()
     if spec:
         paths = [p.strip() for p in re.split(r"[,;]", spec) if p.strip()]
     else:
         paths = []
-        for pattern in ("bestcf-results*.csv", "bestcf*.csv"):
+        for pattern in ("bestcf-results*.csv", "bestcf*.csv", "entries*.txt", "edge*.txt"):
             for found in sorted(glob.glob(os.path.join(REPO_DIR, pattern))):
                 if found not in paths:
                     paths.append(found)
-    entries, seen = [], set()
+    entries, seen, order, slow = [], set(), 0, 0
     for path in paths:
         try:
             if path.startswith(("http://", "https://")):
-                resp = requests.get(path, timeout=HTTP_TIMEOUT)
+                resp = requests.get(path, timeout=HTTP_TIMEOUT, headers={"User-Agent": "Mozilla/5.0"})
                 resp.raise_for_status()
-                rows = list(csv.DictReader(io.StringIO(resp.text)))
+                text = resp.text
             elif os.path.isfile(path):
-                with open(path, encoding="utf-8-sig", newline="") as fh:
-                    rows = list(csv.DictReader(fh))
+                with open(path, encoding="utf-8-sig", errors="replace") as fh:
+                    text = fh.read()
             else:
-                log("EDGE", f"优选域名 CSV 不存在, 跳过: {path}")
+                log("EDGE", f"入口域名清单不存在, 跳过: {path}")
                 continue
         except Exception as exc:
-            log("EDGE", f"读取优选域名 CSV 失败 {path}: {exc}")
+            log("EDGE", f"读取入口域名清单失败 {path}: {exc}")
             continue
-        for row in rows:
-            host = (row.get("优选域名") or "").strip()
-            if not host:
-                values = [v for v in row.values() if v]
-                host = (values[0] or "").strip() if values else ""
+
+        first = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+        is_csv = "," in first and ("域名" in first or "host" in first.lower() or "ip" in first.lower())
+        if is_csv:
+            items = []
+            for row in csv.DictReader(io.StringIO(text)):
+                host = (row.get("优选域名") or "").strip()
+                if not host:
+                    values = [v for v in row.values() if v]
+                    host = (values[0] or "").strip() if values else ""
+                try:
+                    latency = float(row.get("延迟(ms)") or 0)
+                except (TypeError, ValueError):
+                    latency = 0.0
+                items.append((latency, host))
+        else:
+            items = [(0.0, ln.split("#", 1)[0].strip()) for ln in text.splitlines()]
+
+        for latency, host in items:
+            if host.startswith(("#", "=")):
+                continue
             if not host or host in seen or "://" in host or " " in host:
                 continue
+            if MAX_ENTRY_LATENCY_MS > 0 and latency > 0 and latency > MAX_ENTRY_LATENCY_MS:
+                slow += 1
+                continue
             seen.add(host)
-            try:
-                latency = float(row.get("延迟(ms)") or 0)
-            except (TypeError, ValueError):
-                latency = 0.0
-            entries.append((latency, host))
+            order += 1
+            entries.append((latency, order, host))
+            if latency > 0:
+                EDGE_LATENCY[host] = latency
     entries.sort(key=lambda item: (item[0] <= 0, item[0], item[1]))
+    if EDGE_MAX_ENTRIES > 0 and len(entries) > EDGE_MAX_ENTRIES:
+        log("EDGE", f"只保留最快的 {EDGE_MAX_ENTRIES} 个入口 (共 {len(entries)} 个)")
+        entries = entries[:EDGE_MAX_ENTRIES]
     if entries:
-        log("EDGE", f"从 CSV 载入优选域名: {len(entries)} 个")
-    return [host for _, host in entries]
+        log("EDGE", f"载入优选入口域名: {len(entries)} 个")
+    if slow:
+        log("EDGE", f"入口延迟 > {MAX_ENTRY_LATENCY_MS}ms 已剔除: {slow} 个")
+    return [host for _, _, host in entries]
 
 
 # 把 bestcf CSV 的入口域名并入候选池 (CSV 实测最快, 排在最前)
@@ -1047,6 +1139,7 @@ def build_hosts_text(data):
         f"# 固定地址: {HOSTS_URL}",
         "# 每行 = 入口地址#名字$sstp://vpn:vpn@节点:端口",
         f"# 入口域名 {len(edge)} 个 (bestcf CSV 优先, 按延迟排序), 每个节点 {copies} 个入口",
+        f"# 延迟 = 入口域名实测延迟, 上限 {MAX_LATENCY_MS}ms (握手耗时见 data.json 的 handshake_ms)" if MAX_LATENCY_MS > 0 else "# 延迟 = 入口域名实测延迟 (不限)",
         "# 名字 = 国家-住宅/机房-编号, 直接区分住宅与机房",
         "# 名字固定; 只有 $sstp:// 后面的节点地址每 30 分钟自动更换",
         "# 账号密码固定 vpn:vpn ; 节点端口必须保留",
@@ -1077,17 +1170,25 @@ def build_hosts_text(data):
         res_nodes = [n for n in nodes if n.get("residential") == "residential"]
         dc_nodes = [n for n in nodes if n.get("residential") != "residential"]
         for i, n in enumerate(res_nodes, 1):
+            assigned = n.get("entries") or []
             for c in range(copies):
-                entry = edge[idx % len(edge)]
-                idx += 1
+                if c < len(assigned):
+                    entry = assigned[c]
+                else:
+                    entry = edge[idx % len(edge)]
+                    idx += 1
                 suffix = "" if c == 0 else f"-{c + 1}"
                 lines.append(
                     f"{entry}#{zh}-住宅-{i:02d}{suffix}$sstp://vpn:vpn@{n['host']}:{n['port']}"
                 )
         for i, n in enumerate(dc_nodes, 1):
+            assigned = n.get("entries") or []
             for c in range(copies):
-                entry = edge[idx % len(edge)]
-                idx += 1
+                if c < len(assigned):
+                    entry = assigned[c]
+                else:
+                    entry = edge[idx % len(edge)]
+                    idx += 1
                 suffix = "" if c == 0 else f"-{c + 1}"
                 lines.append(
                     f"{entry}#{zh}-机房-{i:02d}{suffix}$sstp://vpn:vpn@{n['host']}:{n['port']}"
@@ -1274,7 +1375,11 @@ def main():
 
     # 4) 结果 + 网页
     data = build_outputs(results, raw_count, sstp_count, source)
-    log("RESULT", f"可用节点: {len(success)}")
+    if MAX_LATENCY_MS > 0:
+        log("RESULT", f"延迟过滤: ≤ {MAX_LATENCY_MS}ms 保留, 丢弃 {data['stats']['slow_filtered']} 个")
+    if data["stats"]["trimmed"]:
+        log("RESULT", f"节点数超过 {MAX_NODES}, 只保留最快的 {MAX_NODES} 个 (丢弃 {data['stats']['trimmed']} 个)")
+    log("RESULT", f"可用节点: {data['stats']['success']}")
     log("RESULT", f"国家数量: {data['stats']['countries']}")
 
     data_path, html_path, chains_path, hosts_path, sub_path = write_outputs(data)
