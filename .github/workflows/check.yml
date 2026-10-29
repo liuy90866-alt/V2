@@ -36,8 +36,8 @@ jobs:
         env:
           # 本站自己的检测 Worker (只认本账号 workers.dev 子域)
           CHECK_WORKER: "https://autumn-sea-4d92.liuy90866.workers.dev/check?sstp=vpn:vpn@"
-          CHECK_CONCURRENCY: "32"
-          CHECK_TIMEOUT: "90"
+          CHECK_CONCURRENCY: "48"
+          CHECK_TIMEOUT: "45"
           # 每个 SSTP 节点生成几个入口行 (1 = 一行一个节点, 最接近手动维护)
           EDGE_COPIES: "1"
           # 额外 SSTP 节点源 (可选, 逗号分隔的 URL 或仓库内文件; 每行一个 host:port)
@@ -45,9 +45,10 @@ jobs:
           # EXTRA_SSTP: "https://raw.githubusercontent.com/Delta-Kronecker/Vpn-Gate/main/sstp_hosts.txt"
           # 全球节点池: 自动从 VPN Gate 滚动池取多国节点 (只取 Cloudflare 预探测可达的)
           POOL_ENABLED: "1"
-          POOL_PER_COUNTRY: "10"
-          # 只使用实测延迟 ≤400ms 的入口清单 (76 个 v2rayN 实测 + 44 个本地 TLS 实测)
-          EDGE_CSV: "entries-final-120.csv"
+          # 上限放宽到 120，保证严格住宅/纯净度筛选后仍能接近 150 个
+          POOL_PER_COUNTRY: "120"
+          # 只使用实测延迟 ≤400ms 的 150 个优选入口域名
+          EDGE_CSV: "entries-final-150.csv"
           # 优选入口域名自身的延迟上限
           MAX_ENTRY_LATENCY_MS: "400"
           # 节点延迟按入口实测延迟计算, 只保留 ≤ 400ms
@@ -55,7 +56,18 @@ jobs:
           # 优选入口只取最快的 300 个
           EDGE_MAX_ENTRIES: "300"
           # 最终节点数上限 (按延迟从快到慢保留)
-          MAX_NODES: "120"
+          MAX_NODES: "150"
+          # 只保留 Worker 明确判定 exit.is_datacenter=false 的住宅候选
+          REQUIRE_RESIDENTIAL: "1"
+          # 只保留 ASN 类型为 isp 的出口 (排除 business/government)
+          REQUIRE_ISP_ASN: "1"
+          # 出口 IP 二次检测: 排除 hosting/mobile, 但不把 proxy 当硬条件
+          # (VPN Gate 的出口本身经常被 IP 情报库标成 proxy/VPN)
+          PURITY_ENABLED: "1"
+          PURITY_REQUIRE_HOSTING_FALSE: "1"
+          PURITY_REQUIRE_PROXY_FALSE: "0"
+          PURITY_REQUIRE_NOT_MOBILE: "1"
+          PURITY_FAIL_OPEN: "1"
 
       - name: Ensure GitHub Pages is enabled (one-time auto setup)
         run: |
