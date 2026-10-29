@@ -28,7 +28,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import requests
 
@@ -44,23 +44,42 @@ for _stream in (sys.stdout, sys.stderr):
 # ---------------------------------------------------------------------------
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# 本站 GitHub Pages 基址 (所有生成文件的对外地址都基于它)
+PAGES_BASE = os.environ.get("PAGES_BASE", "https://liuy90866-alt.github.io/V2").rstrip("/")
+
 VPNGATE_API = os.environ.get("VPNGATE_API", "http://www.vpngate.net/api/iphone/")
 # 官方接口失败时的回退数据源: 预解析 JSON 镜像 (字段与官方 CSV 同源)
 VPNGATE_MIRROR = os.environ.get(
     "VPNGATE_MIRROR",
     "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/json/data.json",
 )
-# 已部署的 Cloudflare Worker 检测接口。主域失败时回退 workers.dev 原地址。
-WORKER_CHECK_URLS = [
-    value
-    for value in (
-        os.environ.get("CHECK_WORKER"),
-        "https://autumn-sea-4d92.liuy90866.workers.dev/check?sstp=vpn:vpn@",
-    )
-    if value
-]
+# 已部署的 Cloudflare Worker 检测接口 (只认本账号自己的 Worker)。
+# 主域失败时回退 workers.dev 原地址; CHECK_WORKER 若指向第三方会被忽略。
+OWN_WORKER_URL = "https://autumn-sea-4d92.liuy90866.workers.dev/check?sstp=vpn:vpn@"
+WORKER_ALLOWED_SUFFIX = os.environ.get("WORKER_ALLOWED_SUFFIX", ".liuy90866.workers.dev")
+
+
+def _is_own_worker(url):
+    """判断 Worker 地址是否属于本账号 (workers.dev 子域或显式允许的后缀)。"""
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return False
+    suffix = WORKER_ALLOWED_SUFFIX.strip().lower()
+    return bool(host) and (host == suffix.lstrip(".") or host.endswith(suffix))
+
+
+WORKER_CHECK_URLS = []
+for _candidate in (os.environ.get("CHECK_WORKER"), OWN_WORKER_URL):
+    if not _candidate:
+        continue
+    if not _is_own_worker(_candidate):
+        print(f"[WARN] 忽略非本账号 Worker 地址: {_candidate}", file=sys.stderr)
+        continue
+    if _candidate not in WORKER_CHECK_URLS:
+        WORKER_CHECK_URLS.append(_candidate)
 if not WORKER_CHECK_URLS:
-    die("CHECK_WORKER 为空且没有默认 Worker 地址")
+    die("没有可用的自有 Worker 地址")
 CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "32")))   # 与 Worker 网页端一致的并发模型
 CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "90"))          # 单请求客户端超时 (秒)
 MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))         # 0=不限; 本地测试可设小值
@@ -426,7 +445,7 @@ def build_outputs(results, raw_count, sstp_count, source):
     return data
 
 
-CHAIN_URL = os.environ.get("CHAIN_URL", "https://jerylihub.github.io/gate/chains.txt")
+CHAIN_URL = os.environ.get("CHAIN_URL", f"{PAGES_BASE}/chains.txt")
 
 
 def build_chains_text(data):
@@ -773,7 +792,7 @@ edge_hosts_raw = os.environ.get(
 )
 EDGE_HOSTS = [h.strip() for h in edge_hosts_raw.split(",") if h.strip()]
 
-HOSTS_URL = os.environ.get("HOSTS_URL", "https://jerylihub.github.io/gate/hosts.txt")
+HOSTS_URL = os.environ.get("HOSTS_URL", f"{PAGES_BASE}/hosts.txt")
 
 
 def build_hosts_text(data):
@@ -832,7 +851,7 @@ def build_hosts_text(data):
 EDT_UUID = os.environ.get("EDT_UUID", "1f06f039-94f1-4ec0-9864-b7aaab41fee4")
 EDT_DOMAIN = os.environ.get("EDT_DOMAIN", "muddy-sun-cb31.liuy90866.workers.dev")
 EDT_FINGERPRINT = os.environ.get("EDT_FINGERPRINT", "chrome")
-SUB_URL = os.environ.get("SUB_URL", "https://jerylihub.github.io/gate/sub.txt")
+SUB_URL = os.environ.get("SUB_URL", f"{PAGES_BASE}/sub.txt")
 
 
 def _b64_secret_encode(plaintext, secret):
