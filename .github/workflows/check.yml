@@ -43,6 +43,9 @@ jobs:
           # 额外 SSTP 节点源 (可选, 逗号分隔的 URL 或仓库内文件; 每行一个 host:port)
           # 实测这份清单的 443 端口节点在你的 Worker 上通过率很低, 需要时再打开:
           # EXTRA_SSTP: "https://raw.githubusercontent.com/Delta-Kronecker/Vpn-Gate/main/sstp_hosts.txt"
+          # 全球节点池: 自动从 VPN Gate 滚动池取多国节点 (只取 Cloudflare 预探测可达的)
+          POOL_ENABLED: "1"
+          POOL_PER_COUNTRY: "8"
 
       - name: Ensure GitHub Pages is enabled (one-time auto setup)
         run: |
