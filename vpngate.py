@@ -86,6 +86,19 @@ CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "32")))   # 与 Wor
 CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "90"))          # 单请求客户端超时 (秒)
 MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))         # 0=不限; 本地测试可设小值
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "60"))              # 拉取数据源超时
+
+# 全球节点池 (VPN Gate 滚动池镜像): 只取 Cloudflare Worker 预探测可达的节点
+POOL_ENABLED = os.environ.get("POOL_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+POOL_PER_COUNTRY = max(0, int(os.environ.get("POOL_PER_COUNTRY", "8")))
+POOL_URL = os.environ.get(
+    "POOL_URL",
+    "https://cdn.jsdelivr.net/gh/GeorgeXie2333/vpngate-list-mirror@latest/pool/servers.json",
+)
+POOL_FALLBACK_URL = os.environ.get(
+    "POOL_FALLBACK_URL",
+    "https://raw.githubusercontent.com/GeorgeXie2333/vpngate-list-mirror/main/pool/servers.json",
+)
+
 PUBLIC_DIR = os.environ.get("PUBLIC_DIR", os.path.join(REPO_DIR, "public"))
 TEMPLATE_HTML = os.path.join(REPO_DIR, "web", "index.html")
 
@@ -121,6 +134,19 @@ COUNTRY_ZH = {
     "SI": "斯洛文尼亚", "BG": "保加利亚", "RS": "塞尔维亚", "GE": "格鲁吉亚",
     "MD": "摩尔多瓦", "AM": "亚美尼亚", "KZ": "哈萨克斯坦", "UZ": "乌兹别克斯坦",
     "MN": "蒙古", "NP": "尼泊尔", "LK": "斯里兰卡", "MM": "缅甸",
+    "BD": "孟加拉国", "PE": "秘鲁", "CR": "哥斯达黎加", "IR": "伊朗", "VE": "委内瑞拉",
+    "LA": "老挝", "KH": "柬埔寨", "BN": "文莱", "PK": "巴基斯坦", "NG": "尼日利亚",
+    "KE": "肯尼亚", "TZ": "坦桑尼亚", "GH": "加纳", "ET": "埃塞俄比亚", "DZ": "阿尔及利亚",
+    "MA": "摩洛哥", "TN": "突尼斯", "JO": "约旦", "KW": "科威特", "QA": "卡塔尔",
+    "OM": "阿曼", "BH": "巴林", "LB": "黎巴嫩", "IQ": "伊拉克", "AZ": "阿塞拜疆",
+    "KG": "吉尔吉斯斯坦", "TJ": "塔吉克斯坦", "TM": "土库曼斯坦", "AF": "阿富汗",
+    "MV": "马尔代夫", "BT": "不丹", "FJ": "斐济", "PG": "巴布亚新几内亚", "GU": "关岛",
+    "PR": "波多黎各", "DO": "多米尼加", "GT": "危地马拉", "HN": "洪都拉斯", "SV": "萨尔瓦多",
+    "NI": "尼加拉瓜", "PA": "巴拿马", "EC": "厄瓜多尔", "BO": "玻利维亚", "PY": "巴拉圭",
+    "UY": "乌拉圭", "CU": "古巴", "JM": "牙买加", "TT": "特立尼达和多巴哥", "BS": "巴哈马",
+    "BB": "巴巴多斯", "BZ": "伯利兹", "HT": "海地", "SR": "苏里南", "GY": "圭亚那",
+    "LU": "卢森堡", "IS": "冰岛", "MT": "马耳他", "CY": "塞浦路斯", "AL": "阿尔巴尼亚",
+    "BA": "波黑", "MK": "北马其顿", "ME": "黑山", "XK": "科索沃", "MO": "澳门",
 }
 
 # ---------------------------------------------------------------------------
@@ -254,6 +280,77 @@ def fetch_extra_sstp():
         log("EXTRA", f"{src} -> {count} 个额外节点")
     if nodes:
         log("EXTRA", f"额外节点合计: {len(nodes)}")
+    return nodes
+
+
+def fetch_pool_nodes():
+    """从 VPN Gate 滚动节点池取全球节点, 每个国家最多 POOL_PER_COUNTRY 个。
+    只保留 tcp_probe.status == "reachable" 的节点 (已由 Cloudflare Worker 预探测可连),
+    因此不会把几千个离线节点全部丢给检测接口。"""
+    if not POOL_ENABLED or POOL_PER_COUNTRY <= 0:
+        return []
+    data = None
+    for url in (POOL_URL, POOL_FALLBACK_URL):
+        if not url:
+            continue
+        try:
+            log("POOL", f"获取全球节点池: {url}")
+            if os.path.isfile(url):
+                with open(url, encoding="utf-8") as fh:
+                    data = json.load(fh)
+            else:
+                resp = requests.get(url, timeout=max(HTTP_TIMEOUT, 120), headers={"User-Agent": "Mozilla/5.0"})
+                resp.raise_for_status()
+                data = resp.json()
+            break
+        except Exception as exc:
+            log("POOL", f"节点池获取失败, 尝试下一个: {exc}")
+    if data is None:
+        log("POOL", "节点池不可用, 跳过 (不影响其它数据源)")
+        return []
+
+    pool = data.get("servers") if isinstance(data, dict) else data
+    if not isinstance(pool, list):
+        log("POOL", "节点池格式不符, 跳过")
+        return []
+
+    by_country = {}
+    for item in pool:
+        if (item.get("tcp_probe") or {}).get("status") != "reachable":
+            continue
+        host = str(item.get("hostname") or "").strip().lower()
+        if not host or host.count(".") > 1:
+            continue
+        if not host.endswith(".opengw.net"):
+            host = f"{host}.opengw.net"
+        port = 0
+        for target in item.get("probe_targets") or []:
+            try:
+                port = int(target.get("port") or 0)
+            except (TypeError, ValueError, AttributeError):
+                port = 0
+            if 0 < port <= 65535:
+                break
+        if not port:
+            continue
+        code = str(item.get("country_code") or "").upper()
+        name = str(item.get("country_name") or "").strip()
+        by_country.setdefault(code, []).append({
+            "host": host,
+            "port": port,
+            "ip": str(item.get("ip") or ""),
+            "country": name,
+            "country_code": code,
+            "_score": int(item.get("score") or 0),
+        })
+
+    nodes = []
+    for items in by_country.values():
+        items.sort(key=lambda n: -n["_score"])
+        for node in items[:POOL_PER_COUNTRY]:
+            node.pop("_score", None)
+            nodes.append(node)
+    log("POOL", f"全局节点池: {len(by_country)} 个国家, 取 {len(nodes)} 个 (每国 ≤ {POOL_PER_COUNTRY})")
     return nodes
 
 
@@ -549,7 +646,7 @@ def build_chains_text(data):
     )
     for cname, grp in ordered:
         code = str(grp.get("code") or "?").upper()
-        zh = COUNTRY_ZH.get(code) or (code if code and code != "?" else cname)
+        zh = COUNTRY_ZH.get(code) or (cname if cname and cname != "?" else code)
         nodes = sorted(
             grp["nodes"],
             key=lambda n: (
@@ -962,7 +1059,7 @@ def build_hosts_text(data):
     )
     for cname, grp in ordered:
         code = str(grp.get("code") or "?").upper()
-        zh = COUNTRY_ZH.get(code) or (code if code and code != "?" else cname)
+        zh = COUNTRY_ZH.get(code) or (cname if cname and cname != "?" else code)
         nodes = sorted(
             grp["nodes"],
             key=lambda n: (
@@ -1056,7 +1153,7 @@ def build_sub_text(data):
     )
     for cname, grp in ordered:
         code = str(grp.get("code") or "?").upper()
-        zh = COUNTRY_ZH.get(code) or (code if code and code != "?" else cname)
+        zh = COUNTRY_ZH.get(code) or (cname if cname and cname != "?" else code)
         nodes = sorted(
             grp["nodes"],
             key=lambda n: (
@@ -1130,11 +1227,21 @@ def main():
 
     # 2) SSTP 筛选 + 去重
     sstp_nodes = to_sstp_nodes(rows)
-    extra_nodes = fetch_extra_sstp()
-    if extra_nodes:
-        sstp_nodes.extend(extra_nodes)
-        raw_count += len(extra_nodes)
-        source += "+extra"
+    # 官方数据里的英文国家名做标准名, 避免同一国家被拆成 "Korea Republic of" / "South Korea"
+    name_by_code = {}
+    for row in rows:
+        code = (row.get("country_short") or "").upper()
+        if code and code not in name_by_code:
+            name_by_code[code] = (row.get("country_long") or "").strip()
+    for label, extra_nodes in (("extra", fetch_extra_sstp()), ("pool", fetch_pool_nodes())):
+        if extra_nodes:
+            for node in extra_nodes:
+                alias = name_by_code.get(node.get("country_code") or "")
+                if alias:
+                    node["country"] = alias
+            sstp_nodes.extend(extra_nodes)
+            raw_count += len(extra_nodes)
+            source += f"+{label}"
     sstp_count = len(sstp_nodes)
     if sstp_count == 0:
         die(f"从 {raw_count} 个原始节点中没有解析出任何 SSTP 节点 — 数据格式可能已变化, 需要人工适配")
