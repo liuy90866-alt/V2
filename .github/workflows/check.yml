@@ -46,6 +46,14 @@ jobs:
           # 全球节点池: 自动从 VPN Gate 滚动池取多国节点 (只取 Cloudflare 预探测可达的)
           POOL_ENABLED: "1"
           POOL_PER_COUNTRY: "8"
+          # 优选入口域名自身的延迟上限 (bestcf CSV 的「延迟(ms)」列)
+          MAX_ENTRY_LATENCY_MS: "300"
+          # 节点延迟按优选入口域名的实测延迟计算, 只保留 ≤ 300ms
+          MAX_LATENCY_MS: "300"
+          # 优选入口只取最快的 300 个
+          EDGE_MAX_ENTRIES: "300"
+          # 最终节点数上限 (按延迟从快到慢保留)
+          MAX_NODES: "300"
 
       - name: Ensure GitHub Pages is enabled (one-time auto setup)
         run: |
