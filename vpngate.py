@@ -3,7 +3,8 @@
 VPN Gate SSTP 节点检测流水线
 ============================
 流程:
-  1. 获取 VPN Gate 原始节点 (官方 api/iphone CSV, 失败时回退 GitHub 预解析镜像)
+  1. 获取 VPN Gate 原始节点 (官方 api/iphone CSV + GitHub 预解析镜像, 两份合并去重)
+     也可用 EXTRA_SSTP 追加额外 host:port 清单
   2. 只保留「带 TCP 入口」的中继 = SSTP 可用节点
      (OpenVPN 配置里 proto tcp + remote <ip> <port>; UDP-only 中继无法走 SSTP/xray 链, 直接丢弃)
   3. 按 host+port+protocol 去重
@@ -26,6 +27,7 @@ import os
 import re
 import sys
 import time
+import glob
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from urllib.parse import quote, urlparse
@@ -147,9 +149,9 @@ def die(msg):
 # ---------------------------------------------------------------------------
 def fetch_vpngate():
     """返回 (rows, source)。rows: [{host, ip, country_long, country_short, config_b64}]
-    官方 API 失败时回退镜像 JSON; 两个都失败 -> 直接 die (exit 1)。"""
-    # --- 主源: 官方 CSV ---
-    try:
+    官方 API 与 GitHub 镜像各取一份并合并去重 (两边节点重合度很低, 合并后数量约翻倍)。
+    只要有一个来源成功就继续; 两个都失败 -> die (exit 1)。"""
+    def _fetch_official():
         log("VPN GATE", f"获取官方 API: {VPNGATE_API}")
         resp = requests.get(
             VPNGATE_API,
@@ -158,25 +160,101 @@ def fetch_vpngate():
         )
         resp.raise_for_status()
         rows = parse_csv(resp.text)
-        if rows:
-            log("VPN GATE", f"主源(官方 API) 获取到 {len(rows)} 个原始节点")
-            return rows, "vpngate.net/api/iphone"
-        raise RuntimeError("官方 API 返回 0 行数据")
-    except Exception as exc:
-        log("VPN GATE", f"官方 API 获取失败: {exc}")
+        if not rows:
+            raise RuntimeError("官方 API 返回 0 行数据")
+        return rows
 
-    # --- 回退源: GitHub 预解析镜像 ---
-    try:
-        log("VPN GATE", f"回退镜像: {VPNGATE_MIRROR}")
+    def _fetch_mirror():
+        log("VPN GATE", f"获取镜像: {VPNGATE_MIRROR}")
         resp = requests.get(VPNGATE_MIRROR, timeout=HTTP_TIMEOUT, headers={"User-Agent": "Mozilla/5.0"})
         resp.raise_for_status()
         rows = parse_mirror_json(resp.json())
-        if rows:
-            log("VPN GATE", f"回退源(镜像) 获取到 {len(rows)} 个原始节点")
-            return rows, "github-mirror"
-    except Exception as exc:
-        log("VPN GATE", f"回退镜像也失败: {exc}")
-    die("VPN Gate 官方 API 与回退镜像均不可用, 数据源完全失败 (不生成空结果, 本次运行判定失败)")
+        if not rows:
+            raise RuntimeError("镜像返回 0 行数据")
+        return rows
+
+    rows, sources = [], []
+    for label, fetch in (("vpngate.net/api/iphone", _fetch_official), ("github-mirror", _fetch_mirror)):
+        try:
+            got = fetch()
+        except Exception as exc:
+            log("VPN GATE", f"{label} 获取失败: {exc}")
+            continue
+        log("VPN GATE", f"{label} 获取到 {len(got)} 个原始节点")
+        rows.extend(got)
+        sources.append(label)
+
+    if not rows:
+        die("VPN Gate 官方 API 与镜像均不可用, 数据源完全失败 (不生成空结果, 本次运行判定失败)")
+
+    merged, seen = [], set()
+    for row in rows:
+        key = (row["host"].lower(), row["ip"])
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(row)
+    log("VPN GATE", f"多源合并去重: {len(merged)} 个原始节点 (来源: {' + '.join(sources)})")
+    return merged, "+".join(sources)
+
+
+def fetch_extra_sstp():
+    """读取 EXTRA_SSTP 里的额外 SSTP 节点清单 (逗号/换行分隔的 URL 或本地文件)。
+    支持 host、host:port、sstp://user:pass@host:port、host:port#名字,
+    以及 `=== Japan (JP) - 195 servers ===` 这类国家分组标题。"""
+    spec = os.environ.get("EXTRA_SSTP", "").strip()
+    if not spec:
+        return []
+    sources = [s.strip() for s in re.split(r"[,;\n]", spec) if s.strip()]
+    nodes, seen = [], set()
+    for src in sources:
+        try:
+            if src.startswith(("http://", "https://")):
+                resp = requests.get(src, timeout=HTTP_TIMEOUT, headers={"User-Agent": "Mozilla/5.0"})
+                resp.raise_for_status()
+                text = resp.text
+            elif os.path.isfile(src):
+                with open(src, encoding="utf-8-sig", errors="replace") as fh:
+                    text = fh.read()
+            else:
+                log("EXTRA", f"额外节点源不存在, 跳过: {src}")
+                continue
+        except Exception as exc:
+            log("EXTRA", f"读取额外节点源失败 {src}: {exc}")
+            continue
+
+        country, code, count = "", "", 0
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            sec = re.match(r"^=+\s*(.+?)\s*\(([A-Za-z]{2})\)", line)
+            if sec:
+                country, code = sec.group(1).strip(), sec.group(2).upper()
+                continue
+            candidate = re.sub(r"^(sstp|https?)://([^@/]*@)?", "", line.split("#", 1)[0].strip(), flags=re.I)
+            m = re.match(r"^(\[[0-9a-fA-F:]+\]|[A-Za-z0-9][A-Za-z0-9_.\-]*)(?::(\d{1,5}))?", candidate)
+            if not m:
+                continue
+            host = m.group(1).strip("[]").lower()
+            port = int(m.group(2) or 443)
+            if not host or not (1 <= port <= 65535) or (host, port) in seen:
+                continue
+            if "." not in host and ":" not in host:
+                continue
+            seen.add((host, port))
+            nodes.append({
+                "host": host,
+                "port": port,
+                "ip": "",
+                "country": country,
+                "country_code": code,
+            })
+            count += 1
+        log("EXTRA", f"{src} -> {count} 个额外节点")
+    if nodes:
+        log("EXTRA", f"额外节点合计: {len(nodes)}")
+    return nodes
 
 
 def parse_csv(text):
@@ -412,8 +490,10 @@ def build_outputs(results, raw_count, sstp_count, source):
     available = [r for r in results if r.get("success")]
     countries = {}
     for n in available:
-        c = n["country"] or "未知"
-        countries.setdefault(c, {"code": n["country_code"] or "?", "nodes": []})["nodes"].append(n)
+        exit_info = n.get("exit") or {}
+        c = n["country"] or exit_info.get("country") or "未知"
+        code = n["country_code"] or exit_info.get("country_code") or "?"
+        countries.setdefault(c, {"code": code, "nodes": []})["nodes"].append(n)
 
     stats = {
         "raw_nodes": raw_count,
@@ -792,6 +872,67 @@ edge_hosts_raw = os.environ.get(
 )
 EDGE_HOSTS = [h.strip() for h in edge_hosts_raw.split(",") if h.strip()]
 
+
+def _load_edge_csv():
+    """读取 bestcf 结果 CSV 里的「优选域名」, 按延迟升序返回 (去重)。
+    EDGE_CSV 可传文件路径或 URL, 多个用逗号分隔; 不传则自动找仓库里的 bestcf*.csv。"""
+    spec = os.environ.get("EDGE_CSV", "").strip()
+    if spec:
+        paths = [p.strip() for p in re.split(r"[,;]", spec) if p.strip()]
+    else:
+        paths = []
+        for pattern in ("bestcf-results*.csv", "bestcf*.csv"):
+            for found in sorted(glob.glob(os.path.join(REPO_DIR, pattern))):
+                if found not in paths:
+                    paths.append(found)
+    entries, seen = [], set()
+    for path in paths:
+        try:
+            if path.startswith(("http://", "https://")):
+                resp = requests.get(path, timeout=HTTP_TIMEOUT)
+                resp.raise_for_status()
+                rows = list(csv.DictReader(io.StringIO(resp.text)))
+            elif os.path.isfile(path):
+                with open(path, encoding="utf-8-sig", newline="") as fh:
+                    rows = list(csv.DictReader(fh))
+            else:
+                log("EDGE", f"优选域名 CSV 不存在, 跳过: {path}")
+                continue
+        except Exception as exc:
+            log("EDGE", f"读取优选域名 CSV 失败 {path}: {exc}")
+            continue
+        for row in rows:
+            host = (row.get("优选域名") or "").strip()
+            if not host:
+                values = [v for v in row.values() if v]
+                host = (values[0] or "").strip() if values else ""
+            if not host or host in seen or "://" in host or " " in host:
+                continue
+            seen.add(host)
+            try:
+                latency = float(row.get("延迟(ms)") or 0)
+            except (TypeError, ValueError):
+                latency = 0.0
+            entries.append((latency, host))
+    entries.sort(key=lambda item: (item[0] <= 0, item[0], item[1]))
+    if entries:
+        log("EDGE", f"从 CSV 载入优选域名: {len(entries)} 个")
+    return [host for _, host in entries]
+
+
+# 把 bestcf CSV 的入口域名并入候选池 (CSV 实测最快, 排在最前)
+EDGE_CSV_HOSTS = _load_edge_csv()
+if EDGE_CSV_HOSTS:
+    _merged, _seen = list(EDGE_CSV_HOSTS), set(EDGE_CSV_HOSTS)
+    for _host in EDGE_HOSTS:
+        if _host not in _seen:
+            _seen.add(_host)
+            _merged.append(_host)
+    EDGE_HOSTS = _merged
+
+# 每个 SSTP 节点生成几个入口行 (1 = 旧行为; 数字越大清单行数越多)
+EDGE_COPIES = max(1, int(os.environ.get("EDGE_COPIES", "3")))
+
 HOSTS_URL = os.environ.get("HOSTS_URL", f"{PAGES_BASE}/hosts.txt")
 
 
@@ -799,15 +940,16 @@ def build_hosts_text(data):
     """生成可直接粘贴到 edgetunnel 后台「自定义优选IP」框的清单。
     每行 = 入口地址#名字$sstp://... ; 名字固定, 底下 SSTP 节点每 30 分钟自动换。"""
     countries = data["countries"]
-    # 入口: 默认用 7 个实测可用优选域名循环分配; 可用 HOSTS_ENTRY 覆盖(逗号分隔)
+    # 入口: bestcf CSV + 内置优选域名; 可用 HOSTS_ENTRY 覆盖(逗号分隔)
     _entry = os.environ.get("HOSTS_ENTRY", "").strip()
     edge = [e.strip() for e in _entry.split(",") if e.strip()] or EDGE_HOSTS or [f"{EDT_DOMAIN}:443"]
+    copies = max(1, min(EDGE_COPIES, len(edge)))
     lines = [
         "# edgetunnel「自定义优选IP」清单 (整段复制, 追加到后台现有内容后面)",
         f"# 自动更新: {data['generated_at']} (每 30 分钟重新检测)",
         f"# 固定地址: {HOSTS_URL}",
         "# 每行 = 入口地址#名字$sstp://vpn:vpn@节点:端口",
-        "# 入口用 7 个实测可用优选域名循环分配",
+        f"# 入口域名 {len(edge)} 个 (bestcf CSV 优先, 按延迟排序), 每个节点 {copies} 个入口",
         "# 名字 = 国家-住宅/机房-编号, 直接区分住宅与机房",
         "# 名字固定; 只有 $sstp:// 后面的节点地址每 30 分钟自动更换",
         "# 账号密码固定 vpn:vpn ; 节点端口必须保留",
@@ -832,18 +974,27 @@ def build_hosts_text(data):
         )
         lines.append("")
         lines.append(
-            f"# ---- {zh} {code} · {grp['count']} 节点 (住宅 {grp['residential']} / 机房 {grp['datacenter']}) ----"
+            f"# ---- {zh} {code} · {grp['count']} 节点 × {copies} 入口 = {int(grp['count']) * copies} 行"
+            f" (住宅 {grp['residential']} / 机房 {grp['datacenter']}) ----"
         )
         res_nodes = [n for n in nodes if n.get("residential") == "residential"]
         dc_nodes = [n for n in nodes if n.get("residential") != "residential"]
         for i, n in enumerate(res_nodes, 1):
-            entry = edge[idx % len(edge)]
-            idx += 1
-            lines.append(f"{entry}#{zh}-住宅-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
+            for c in range(copies):
+                entry = edge[idx % len(edge)]
+                idx += 1
+                suffix = "" if c == 0 else f"-{c + 1}"
+                lines.append(
+                    f"{entry}#{zh}-住宅-{i:02d}{suffix}$sstp://vpn:vpn@{n['host']}:{n['port']}"
+                )
         for i, n in enumerate(dc_nodes, 1):
-            entry = edge[idx % len(edge)]
-            idx += 1
-            lines.append(f"{entry}#{zh}-机房-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
+            for c in range(copies):
+                entry = edge[idx % len(edge)]
+                idx += 1
+                suffix = "" if c == 0 else f"-{c + 1}"
+                lines.append(
+                    f"{entry}#{zh}-机房-{i:02d}{suffix}$sstp://vpn:vpn@{n['host']}:{n['port']}"
+                )
     return "\n".join(lines) + "\n"
 
 
@@ -979,9 +1130,14 @@ def main():
 
     # 2) SSTP 筛选 + 去重
     sstp_nodes = to_sstp_nodes(rows)
+    extra_nodes = fetch_extra_sstp()
+    if extra_nodes:
+        sstp_nodes.extend(extra_nodes)
+        raw_count += len(extra_nodes)
+        source += "+extra"
     sstp_count = len(sstp_nodes)
     if sstp_count == 0:
-        die(f"从 {raw_count} 个原始节点中没有解析出任何 SSTP(TCP) 节点 — 数据格式可能已变化, 需要人工适配")
+        die(f"从 {raw_count} 个原始节点中没有解析出任何 SSTP 节点 — 数据格式可能已变化, 需要人工适配")
     uniq = dedupe(sstp_nodes)
 
     if MAX_CHECK_NODES > 0:
