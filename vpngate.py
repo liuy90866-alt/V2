@@ -108,24 +108,24 @@ POOL_FALLBACK_URL = os.environ.get(
 
 # 节点延迟 = 优选入口域名的实测延迟 (CSV 的「延迟(ms)」列), 默认只保留 ≤400ms。
 # Worker 返回的 SSTP 握手耗时另存为 handshake_ms, 不参与过滤。
-MAX_LATENCY_MS = int(os.environ.get("MAX_LATENCY_MS", "400"))
+MAX_LATENCY_MS = int(os.environ.get("MAX_LATENCY_MS", "300"))
 # 优选入口只取最快的 N 个 (0 = 不限)
 EDGE_MAX_ENTRIES = max(0, int(os.environ.get("EDGE_MAX_ENTRIES", "300")))
 # 最终节点数上限, 按延迟从快到慢保留 (0 = 不限)
-MAX_NODES = max(0, int(os.environ.get("MAX_NODES", "150")))
+MAX_NODES = max(0, int(os.environ.get("MAX_NODES", "200")))
 # 优选入口域名自身的延迟上限 (CSV 的「延迟(ms)」列); 0 = 不限制
 MAX_ENTRY_LATENCY_MS = int(os.environ.get("MAX_ENTRY_LATENCY_MS", "400"))
 
 # 严格住宅筛选: 只接受 Worker 明确返回 exit.is_datacenter=false 的节点。
 # Worker 无法识别 (None) 的节点不会冒充住宅节点。
-REQUIRE_RESIDENTIAL = env_flag("REQUIRE_RESIDENTIAL", "1")
+REQUIRE_RESIDENTIAL = env_flag("REQUIRE_RESIDENTIAL", "0")
 # 家庭宽带通常由 ISP 持有; business/government 网络不当作住宅候选。
-REQUIRE_ISP_ASN = env_flag("REQUIRE_ISP_ASN", "1")
+REQUIRE_ISP_ASN = env_flag("REQUIRE_ISP_ASN", "0")
 
 # 出口 IP 二次纯净度检测 (ip-api.com batch, 免费接口每批最多 100 个 IP)。
 # proxy=false 默认不强制，因为 VPN Gate 出口本身通常会被情报库标成 proxy/VPN；
 # hosting=false 和 mobile=false 用来尽量排除机房与移动网络。
-PURITY_ENABLED = env_flag("PURITY_ENABLED", "1")
+PURITY_ENABLED = env_flag("PURITY_ENABLED", "0")
 PURITY_REQUIRE_HOSTING_FALSE = env_flag("PURITY_REQUIRE_HOSTING_FALSE", "1")
 PURITY_REQUIRE_PROXY_FALSE = env_flag("PURITY_REQUIRE_PROXY_FALSE", "0")
 PURITY_REQUIRE_NOT_MOBILE = env_flag("PURITY_REQUIRE_NOT_MOBILE", "1")
