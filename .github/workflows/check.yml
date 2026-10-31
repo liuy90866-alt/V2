@@ -45,28 +45,29 @@ jobs:
           # EXTRA_SSTP: "https://raw.githubusercontent.com/Delta-Kronecker/Vpn-Gate/main/sstp_hosts.txt"
           # 全球节点池: 自动从 VPN Gate 滚动池取多国节点 (只取 Cloudflare 预探测可达的)
           POOL_ENABLED: "1"
-          # 目标国家候选池上限，给 200 个最终节点留出足够候选
-          POOL_PER_COUNTRY: "60"
+          # 目标国家候选池上限: 因为最终不限量, 候选取多一些才能把 <300ms 的节点都捞出来
+          POOL_PER_COUNTRY: "80"
           # 使用实测延迟 ≤300ms 的 200 个优选入口域名
           EDGE_CSV: "entries-final-200.csv"
           # 优选入口域名自身的延迟上限
           MAX_ENTRY_LATENCY_MS: "300"
-          # 节点网络延迟 = 客户端到优选入口的实测延迟, 只保留 ≤ 300ms
+          # 节点网络延迟 = 客户端到优选入口的实测延迟, 只保留 < 300ms
           # 修正: Worker responseTime 是 SSTP 建链耗时, 不是 ping; 不能加进网络延迟
           MAX_LATENCY_MS: "300"
           # SSTP 建链耗时上限 (TCP+TLS+认证; 0 = 不限制)
           MAX_HANDSHAKE_MS: "5000"
           # 优选入口只取最快的 300 个
           EDGE_MAX_ENTRIES: "300"
-          # 最终节点数上限 (按延迟从快到慢保留)
-          MAX_NODES: "200"
+          # 最终节点数上限 (0 = 不限)。低于 300ms 的节点全要, 不按数量截断。
+          MAX_NODES: "0"
           # 只保留这些地区: 美/日/韩/俄/印 + 中国周边; 其它国家一律不保留 (也不参与补位)
           TARGET_COUNTRIES: "US,JP,KR,RU,IN,MN,VN,TH,MM,LA,KH,MY,SG,PH,ID,PK,BD,NP,LK,KZ,KG,TJ,UZ,TM,TW,HK,MO"
-          # 每国最多 20 个, 节点多的国家只保留约 20
-          PER_COUNTRY_MAX: "20"
+          # 每国上限 (0 = 不限)。住宅/机房一视同仁, 按速度全收。
+          # 想回到「每国约 20」就填 20
+          PER_COUNTRY_MAX: "0"
           # 可用节点不足 3 个的国家整国剔除 (只有 1-2 个节点的不要)
           MIN_PER_COUNTRY: "3"
-          # 0 = 每国 20 是硬上限 (总数可能不到 200 也不跨国凑数); 1 = 不足 200 时从目标国家溢出节点补位
+          # 仅当上面设了每国上限时有意义: 1 = 总数不足 MAX_NODES 时从目标国家溢出节点补位
           TOP_UP_TO_MAX_NODES: "0"
           # 住宅与机房都保留
           REQUIRE_RESIDENTIAL: "0"
