@@ -96,7 +96,7 @@ HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "60"))              # 拉取�
 
 # 全球节点池 (VPN Gate 滚动池镜像): 只取 Cloudflare Worker 预探测可达的节点
 POOL_ENABLED = os.environ.get("POOL_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
-POOL_PER_COUNTRY = max(0, int(os.environ.get("POOL_PER_COUNTRY", "120")))
+POOL_PER_COUNTRY = max(0, int(os.environ.get("POOL_PER_COUNTRY", "20")))
 POOL_URL = os.environ.get(
     "POOL_URL",
     "https://cdn.jsdelivr.net/gh/GeorgeXie2333/vpngate-list-mirror@latest/pool/servers.json",
@@ -106,15 +106,33 @@ POOL_FALLBACK_URL = os.environ.get(
     "https://raw.githubusercontent.com/GeorgeXie2333/vpngate-list-mirror/main/pool/servers.json",
 )
 
-# 节点延迟 = 优选入口域名的实测延迟 (CSV 的「延迟(ms)」列), 默认只保留 ≤400ms。
-# Worker 返回的 SSTP 握手耗时另存为 handshake_ms, 不参与过滤。
+# 「网络延迟」= 客户端到 Cloudflare 优选入口的实测延迟 (CSV 的延迟(ms)), 默认 ≤300ms。
+# Worker 的 responseTime 是 SSTP 隧道建立耗时 (TCP+TLS+MS-CHAPv2, 实测 2.7-4.4s),
+# 属于一次性建链开销, 不能当 ping 用, 因此单独用 MAX_HANDSHAKE_MS 控制。
 MAX_LATENCY_MS = int(os.environ.get("MAX_LATENCY_MS", "300"))
+# SSTP 建链耗时上限 (0 = 不限制)
+MAX_HANDSHAKE_MS = int(os.environ.get("MAX_HANDSHAKE_MS", "5000"))
 # 优选入口只取最快的 N 个 (0 = 不限)
 EDGE_MAX_ENTRIES = max(0, int(os.environ.get("EDGE_MAX_ENTRIES", "300")))
 # 最终节点数上限, 按延迟从快到慢保留 (0 = 不限)
 MAX_NODES = max(0, int(os.environ.get("MAX_NODES", "200")))
 # 优选入口域名自身的延迟上限 (CSV 的「延迟(ms)」列); 0 = 不限制
-MAX_ENTRY_LATENCY_MS = int(os.environ.get("MAX_ENTRY_LATENCY_MS", "400"))
+MAX_ENTRY_LATENCY_MS = int(os.environ.get("MAX_ENTRY_LATENCY_MS", "300"))
+
+# 只保留这些地区: 美国/日本/韩国/俄罗斯/印度 + 中国周边国家。其余国家全部丢弃。
+DEFAULT_TARGET_COUNTRIES = "US,JP,KR,RU,IN,MN,VN,TH,MM,LA,KH,MY,SG,PH,ID,PK,BD,NP,LK,KZ,KG,TJ,UZ,TM,TW,HK,MO"
+TARGET_COUNTRIES = [
+    c.strip().upper()
+    for c in os.environ.get("TARGET_COUNTRIES", DEFAULT_TARGET_COUNTRIES).split(",")
+    if c.strip()
+]
+# 每国最终保留上限 (节点多的国家只留这么多, 约 20)
+PER_COUNTRY_MAX = max(0, int(os.environ.get("PER_COUNTRY_MAX", "20")))
+# 可用节点少于这个数量的国家整国丢弃 (只有 1-2 个节点的国家不保留)
+MIN_PER_COUNTRY = max(0, int(os.environ.get("MIN_PER_COUNTRY", "3")))
+# 默认不把单国补到 20 以上 (每国 20 是硬上限, 200 只是总数上限)。
+# 想尽量凑满 200 时设为 1: 不足部分从目标国家的溢出节点里按延迟补。
+TOP_UP_TO_MAX_NODES = env_flag("TOP_UP_TO_MAX_NODES", "0")
 
 # 严格住宅筛选: 只接受 Worker 明确返回 exit.is_datacenter=false 的节点。
 # Worker 无法识别 (None) 的节点不会冒充住宅节点。
@@ -371,6 +389,8 @@ def fetch_pool_nodes():
         if not port:
             continue
         code = str(item.get("country_code") or "").upper()
+        if code not in TARGET_COUNTRIES:
+            continue
         name = str(item.get("country_name") or "").strip()
         by_country.setdefault(code, []).append({
             "host": host,
@@ -711,6 +731,21 @@ def check_exit_purity(results, session):
 # ---------------------------------------------------------------------------
 # 第 4 步: 生成网页数据
 # ---------------------------------------------------------------------------
+def _node_country_code(node):
+    """统一取国家码: 优先 VPN Gate 标注, 其次 Worker 出口 IP 国家。"""
+    return str(node.get("country_code") or (node.get("exit") or {}).get("country_code") or "?").strip().upper()
+
+
+def _latency_key(node):
+    """延迟未知的排最后, 不让它冒充 0ms 快节点。"""
+    lat = node.get("latency_ms")
+    try:
+        lat = float(lat)
+    except (TypeError, ValueError):
+        lat = None
+    return (lat is None, lat if lat is not None else float("inf"), node.get("host") or "")
+
+
 def build_outputs(results, raw_count, sstp_count, source):
     def _num(value):
         try:
@@ -721,8 +756,7 @@ def build_outputs(results, raw_count, sstp_count, source):
     success = [r for r in results if r.get("success")]
 
     # 给每个节点分配优选入口域名 (hosts.txt 里同一节点会用到这几行)。
-    # 页面/清单里的「延迟」改用入口域名的实测延迟 (bestcf CSV 的 延迟(ms)),
-    # Worker 的 SSTP 握手耗时单独存到 handshake_ms。
+    # latency_ms = 入口实测延迟 (可比的"网络延迟"); setup_ms = SSTP 建链耗时。
     edge = EDGE_HOSTS or [f"{EDT_DOMAIN}:443"]
     if EDGE_LATENCY:
         measured = sorted((e for e in edge if e in EDGE_LATENCY), key=lambda e: EDGE_LATENCY[e])
@@ -743,15 +777,42 @@ def build_outputs(results, raw_count, sstp_count, source):
         node["entry"] = picks[0]
         node["entry_latency_ms"] = min(latencies) if latencies else None
         node["handshake_ms"] = node.get("latency_ms")
-        if latencies:
-            node["latency_ms"] = min(latencies)
+        entry_ms = node["entry_latency_ms"]
+        hand_ms = _num(node.get("handshake_ms"))
+        node["setup_ms"] = hand_ms
+        if entry_ms is not None:
+            node["latency_ms"] = entry_ms
+        elif not entry_known:
+            node["latency_ms"] = hand_ms  # 没有入口延迟数据时退回建链耗时
+        else:
+            node["latency_ms"] = None     # 缺数据不当 0ms 用
 
-    available, slow = [], 0
+    # 先做基础过滤，便于后面按国家统一排序与补位。
+    candidates = []
+    slow = unknown_latency = 0
+    setup_slow = 0
     residential_rejected = asn_type_rejected = purity_rejected = purity_unknown = 0
     for r in success:
         lat = _num(r.get("latency_ms"))
-        if MAX_LATENCY_MS > 0 and entry_known and (lat is None or lat > MAX_LATENCY_MS):
-            slow += 1
+        # 只有拿到入口实测延迟时才做 300ms 判定; 没有入口数据就交给建链耗时上限。
+        if MAX_LATENCY_MS > 0 and entry_known:
+            if lat is None:
+                unknown_latency += 1
+                continue
+            if lat > MAX_LATENCY_MS:
+                slow += 1
+                continue
+        # SSTP 建链太慢的节点丢连 (一次性开销, 与 ping 不同量级)
+        if MAX_HANDSHAKE_MS > 0:
+            setup = _num(r.get("setup_ms"))
+            if setup is not None and setup > MAX_HANDSHAKE_MS:
+                setup_slow += 1
+                continue
+            if setup is None:
+                unknown_latency += 1
+                continue
+        code = (r.get("country_code") or (r.get("exit") or {}).get("country_code") or "").upper()
+        if not code or code not in TARGET_COUNTRIES:
             continue
         exit_info = r.get("exit") or {}
         if REQUIRE_RESIDENTIAL and exit_info.get("is_datacenter") is not False:
@@ -770,16 +831,45 @@ def build_outputs(results, raw_count, sstp_count, source):
                 if not PURITY_FAIL_OPEN:
                     purity_rejected += 1
                     continue
-        available.append(r)
+        candidates.append(r)
+
+    by_code = {}
+    for n in candidates:
+        by_code.setdefault(_node_country_code(n), []).append(n)
+    for nodes in by_code.values():
+        nodes.sort(key=_latency_key)
+
+    # 先剔除只有 1-2 个可用节点的国家, 太碎的国家没有维护价值。
+    small_countries = small_nodes = 0
+    if MIN_PER_COUNTRY > 0:
+        for code in [c for c, nodes in by_code.items() if len(nodes) < MIN_PER_COUNTRY]:
+            small_nodes += len(by_code.pop(code))
+            small_countries += 1
+
+    # 每国最多 PER_COUNTRY_MAX 个 (硬上限); TOP_UP_TO_MAX_NODES=1 时才按延迟从溢出节点补位。
+    available, overflow = [], []
+    capped = 0
+    for nodes in by_code.values():
+        if PER_COUNTRY_MAX > 0:
+            available.extend(nodes[:PER_COUNTRY_MAX])
+            overflow.extend(nodes[PER_COUNTRY_MAX:])
+            capped += max(0, len(nodes) - PER_COUNTRY_MAX)
+        else:
+            available.extend(nodes)
+
+    filled = 0
+    if TOP_UP_TO_MAX_NODES and MAX_NODES > 0 and len(available) < MAX_NODES and overflow:
+        overflow.sort(key=_latency_key)
+        take = min(len(overflow), MAX_NODES - len(available))
+        available.extend(overflow[:take])
+        filled = take
+        capped -= take
 
     trimmed = 0
     if MAX_NODES > 0 and len(available) > MAX_NODES:
-        available.sort(
-            key=lambda n: (n.get("latency_ms") is None, n.get("latency_ms") or 0, n.get("host") or "")
-        )
+        available.sort(key=_latency_key)
         trimmed = len(available) - MAX_NODES
         available = available[:MAX_NODES]
-
     countries = {}
     for n in available:
         exit_info = n.get("exit") or {}
@@ -800,21 +890,28 @@ def build_outputs(results, raw_count, sstp_count, source):
             1 for n in available if (n.get("exit") or {}).get("is_datacenter") is False
         ),
         "slow_filtered": slow,
+        "unknown_latency_filtered": unknown_latency,
+        "setup_filtered": setup_slow,
         "residential_filtered": residential_rejected,
         "asn_type_filtered": asn_type_rejected,
         "purity_filtered": purity_rejected,
         "purity_unknown": purity_unknown,
+        "target_countries": len(TARGET_COUNTRIES),
+"min_per_country": MIN_PER_COUNTRY,
+"small_country_groups": small_countries,
+"small_country_nodes": small_nodes,
+        "per_country_capped": capped,
+        "gap_filled": filled,
         "trimmed": trimmed,
         "max_latency_ms": MAX_LATENCY_MS,
         "max_nodes": MAX_NODES,
-        "latency_metric": "entry" if entry_known else "handshake",
+        "latency_metric": "entry_latency" if entry_known else "setup_time",
         "latency_note": (
-            "latency_ms = 本地/GitHub Runner 到 Cloudflare 优选入口的实测延迟，"
-            "不是 SSTP 整段链路延迟；handshake_ms = Worker 的 SSTP 握手耗时，也不等于 ping。"
+            "latency_ms = 客户端到 Cloudflare 入口的实测延迟；setup_ms/handshake_ms = SSTP 建链耗时。"
+            "建链耗时是 TCP+TLS+认证的一次性开销，不是 ping。"
         ),
         "residential_note": (
-            "住宅候选 = Worker 出口 IP 情报 is_datacenter=false 且 ASN 类型为 isp；"
-            "VPN Gate 无法保证家庭宽带或原生 IP。"
+            "住宅/机房都保留；不能保证家庭宽带或原生 IP。"
         ),
         "purity_note": (
             "purity 来自 ip-api：默认要求 hosting=false 且 mobile=false；"
@@ -827,7 +924,7 @@ def build_outputs(results, raw_count, sstp_count, source):
         grp["count"] = len(grp["nodes"])
         grp["residential"] = sum(1 for n in grp["nodes"] if n["residential"] == "residential")
         grp["datacenter"] = sum(1 for n in grp["nodes"] if n["residential"] == "datacenter")
-        grp["nodes"].sort(key=lambda n: (n.get("latency_ms") is None, n.get("latency_ms") or 0, n["host"]))
+        grp["nodes"].sort(key=lambda n: (n.get("latency_ms") is None, n.get("latency_ms") or float("inf"), n["host"]))
         by_country[name] = grp
 
     data = {
@@ -1295,9 +1392,9 @@ def build_hosts_text(data):
         "# 每行 = 入口地址#名字$sstp://vpn:vpn@节点:端口",
         f"# 入口域名 {len(edge)} 个 (bestcf CSV 优先, 按延迟排序), 每个节点 {copies} 个入口",
         (
-            f"# 延迟 = 到 Cloudflare 入口的实测延迟, 上限 {MAX_LATENCY_MS}ms (不是 SSTP 整段延迟)"
+            f"# 网络延迟 = 入口实测延迟, 上限 {MAX_LATENCY_MS}ms; SSTP 建链耗时上限 {MAX_HANDSHAKE_MS}ms"
             if MAX_LATENCY_MS > 0
-            else "# 延迟 = 到 Cloudflare 入口的实测延迟 (不限; 不是 SSTP 整段延迟)"
+            else "# 网络延迟 = 入口实测延迟 (不限)"
         ),
         "# 名字 = 国家-住宅候选/机房-编号; 住宅候选由出口 IP 情报判定",
         "# 注意: VPN Gate 无法保证家庭宽带/原生 IP; 清单不把候选写成保证",
@@ -1406,7 +1503,7 @@ def build_sub_text(data):
         f"# 节点域名: {EDT_DOMAIN} (传输 ws / TLS / fingerprint {EDT_FINGERPRINT})",
         "# 名字固定; $sstp:// 链式代理(编码在 path)每 30 分钟自动更换",
         "# 账号密码固定 vpn:vpn ; 节点端口已编码进 path",
-        "# 延迟说明: data.json 的 latency_ms 是入口延迟, 不是 SSTP 整段链路延迟",
+        "# 延迟说明: latency_ms = 入口实测延迟; setup_ms = SSTP 建链耗时",
         "# IP 说明: VPN Gate 出口无法保证家庭宽带/原生 IP, 仅做住宅候选筛选",
         "# ========================================================",
     ]
@@ -1542,6 +1639,12 @@ def main():
     data = build_outputs(results, raw_count, sstp_count, source)
     if MAX_LATENCY_MS > 0:
         log("RESULT", f"延迟过滤: ≤ {MAX_LATENCY_MS}ms 保留, 丢弃 {data['stats']['slow_filtered']} 个")
+    if MAX_HANDSHAKE_MS > 0:
+        log(
+            "RESULT",
+            f"SSTP 建链过滤: ≤ {MAX_HANDSHAKE_MS}ms 保留, "
+            f"丢弃 {data['stats']['setup_filtered']} 个"
+        )
     if REQUIRE_RESIDENTIAL:
         log(
             "RESULT",
@@ -1559,13 +1662,27 @@ def main():
             f"纯净度过滤: 丢弃 {data['stats']['purity_filtered']} 个, "
             f"情报未知 {data['stats']['purity_unknown']} 个",
         )
+    if data["stats"]["small_country_nodes"]:
+        log(
+            "RESULT",
+            f"整国剔除: {data['stats']['small_country_groups']} 个国家可用节点不足 {MIN_PER_COUNTRY} 个 "
+            f"(丢弃 {data['stats']['small_country_nodes']} 个)"
+        )
+    if data["stats"]["per_country_capped"]:
+        log("RESULT", f"每国上限 {PER_COUNTRY_MAX}: 丢弃 {data['stats']['per_country_capped']} 个")
+    if data["stats"]["gap_filled"]:
+        log(
+            "RESULT",
+            f"目标国家内补位: 追加 {data['stats']['gap_filled']} 个 (凑近 {MAX_NODES} 总数, 不引入其它国家)"
+        )
+
     if data["stats"]["trimmed"]:
         log("RESULT", f"节点数超过 {MAX_NODES}, 只保留最快的 {MAX_NODES} 个 (丢弃 {data['stats']['trimmed']} 个)")
     elif MAX_NODES > 0 and data["stats"]["success"] < MAX_NODES:
         log(
             "RESULT",
-            f"严格筛选后只有 {data['stats']['success']} 个节点 (目标 {MAX_NODES}); "
-            "没有用未验证节点凑数",
+        f"严格筛选后只有 {data['stats']['success']} 个节点 (目标 ≤{MAX_NODES}, 每国 ≤{PER_COUNTRY_MAX}, 建国下限 {MIN_PER_COUNTRY}); "
+        "不足部分没有用非目标国家、慢节点或 1-2 个节点的碎片国家凑数",
         )
     log("RESULT", f"可用节点: {data['stats']['success']}")
     log("RESULT", f"国家数量: {data['stats']['countries']}")
@@ -1586,3 +1703,4 @@ if __name__ == "__main__":
         raise
     except Exception as exc:
         die(f"程序异常: {type(exc).__name__}: {exc}")
+
