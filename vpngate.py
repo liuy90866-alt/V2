@@ -106,7 +106,7 @@ POOL_FALLBACK_URL = os.environ.get(
     "https://raw.githubusercontent.com/GeorgeXie2333/vpngate-list-mirror/main/pool/servers.json",
 )
 
-# 「网络延迟」= 客户端到 Cloudflare 优选入口的实测延迟 (CSV 的延迟(ms)), 默认 ≤300ms。
+# 「网络延迟」= 客户端到 Cloudflare 优选入口的实测延迟 (CSV 的延迟(ms)), 默认 <300ms。
 # Worker 的 responseTime 是 SSTP 隧道建立耗时 (TCP+TLS+MS-CHAPv2, 实测 2.7-4.4s),
 # 属于一次性建链开销, 不能当 ping 用, 因此单独用 MAX_HANDSHAKE_MS 控制。
 MAX_LATENCY_MS = int(os.environ.get("MAX_LATENCY_MS", "300"))
@@ -114,8 +114,8 @@ MAX_LATENCY_MS = int(os.environ.get("MAX_LATENCY_MS", "300"))
 MAX_HANDSHAKE_MS = int(os.environ.get("MAX_HANDSHAKE_MS", "5000"))
 # 优选入口只取最快的 N 个 (0 = 不限)
 EDGE_MAX_ENTRIES = max(0, int(os.environ.get("EDGE_MAX_ENTRIES", "300")))
-# 最终节点数上限, 按延迟从快到慢保留 (0 = 不限)
-MAX_NODES = max(0, int(os.environ.get("MAX_NODES", "200")))
+# 最终节点数上限 (0 = 不限)。默认不限: 只要网络延迟低于上限就全要。
+MAX_NODES = max(0, int(os.environ.get("MAX_NODES", "0")))
 # 优选入口域名自身的延迟上限 (CSV 的「延迟(ms)」列); 0 = 不限制
 MAX_ENTRY_LATENCY_MS = int(os.environ.get("MAX_ENTRY_LATENCY_MS", "300"))
 
@@ -126,12 +126,11 @@ TARGET_COUNTRIES = [
     for c in os.environ.get("TARGET_COUNTRIES", DEFAULT_TARGET_COUNTRIES).split(",")
     if c.strip()
 ]
-# 每国最终保留上限 (节点多的国家只留这么多, 约 20)
-PER_COUNTRY_MAX = max(0, int(os.environ.get("PER_COUNTRY_MAX", "20")))
+# 每国最终保留上限 (0 = 不限)。默认不限: 住宅和机房一并按速度全收。
+PER_COUNTRY_MAX = max(0, int(os.environ.get("PER_COUNTRY_MAX", "0")))
 # 可用节点少于这个数量的国家整国丢弃 (只有 1-2 个节点的国家不保留)
 MIN_PER_COUNTRY = max(0, int(os.environ.get("MIN_PER_COUNTRY", "3")))
-# 默认不把单国补到 20 以上 (每国 20 是硬上限, 200 只是总数上限)。
-# 想尽量凑满 200 时设为 1: 不足部分从目标国家的溢出节点里按延迟补。
+# 只有设了每国上限时才有效: 1 = 总数不足 MAX_NODES 时, 从目标国家的溢出节点补位。
 TOP_UP_TO_MAX_NODES = env_flag("TOP_UP_TO_MAX_NODES", "0")
 
 # 严格住宅筛选: 只接受 Worker 明确返回 exit.is_datacenter=false 的节点。
@@ -794,12 +793,12 @@ def build_outputs(results, raw_count, sstp_count, source):
     residential_rejected = asn_type_rejected = purity_rejected = purity_unknown = 0
     for r in success:
         lat = _num(r.get("latency_ms"))
-        # 只有拿到入口实测延迟时才做 300ms 判定; 没有入口数据就交给建链耗时上限。
+        # 只有拿到入口实测延迟时才做上限判定; 没有入口数据就交给建链耗时上限。
         if MAX_LATENCY_MS > 0 and entry_known:
             if lat is None:
                 unknown_latency += 1
                 continue
-            if lat > MAX_LATENCY_MS:
+            if lat >= MAX_LATENCY_MS:
                 slow += 1
                 continue
         # SSTP 建链太慢的节点丢连 (一次性开销, 与 ping 不同量级)
@@ -942,7 +941,7 @@ CHAIN_URL = os.environ.get("CHAIN_URL", f"{PAGES_BASE}/chains.txt")
 
 
 def build_chains_text(data):
-    """生成 edgetunnel 链式代理清单: 按国家分组, 每国编号固定, 住宅优先, 延迟升序。
+    """生成 edgetunnel 链式代理清单: 按国家分组, 住宅/机房混排, 延迟升序。
     每行 = 「名字 + $sstp://vpn:vpn@host:port」, 名字不变, 指令每 30 分钟自动换。"""
     countries = data["countries"]
     lines = [
@@ -966,7 +965,6 @@ def build_chains_text(data):
         nodes = sorted(
             grp["nodes"],
             key=lambda n: (
-                0 if n.get("residential") == "residential" else 1,
                 n.get("latency_ms") is None,
                 n.get("latency_ms") or 0,
                 n.get("host") or "",
@@ -976,12 +974,9 @@ def build_chains_text(data):
         lines.append(
             f"# ---- {zh} {code} · {grp['count']} 节点 (住宅 {grp['residential']} / 机房 {grp['datacenter']}) ----"
         )
-        res_nodes = [n for n in nodes if n.get("residential") == "residential"]
-        dc_nodes = [n for n in nodes if n.get("residential") != "residential"]
-        for i, n in enumerate(res_nodes, 1):
-            lines.append(f"{zh}-住宅-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
-        for i, n in enumerate(dc_nodes, 1):
-            lines.append(f"{zh}-机房-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
+        for i, n in enumerate(nodes, 1):
+            kind = "住宅" if n.get("residential") == "residential" else "机房"
+            lines.append(f"{zh}-{kind}-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
     return "\n".join(lines) + "\n"
 
 
@@ -1379,7 +1374,7 @@ HOSTS_URL = os.environ.get("HOSTS_URL", f"{PAGES_BASE}/hosts.txt")
 
 def build_hosts_text(data):
     """生成可直接粘贴到 edgetunnel 后台「自定义优选IP」框的清单。
-    每行 = 入口地址#名字$sstp://... ; 名字固定, 底下 SSTP 节点每 30 分钟自动换。"""
+    每行 = 入口地址#名字$sstp://... ; 住宅/机房混排, 按延迟升序, 名字固定。"""
     countries = data["countries"]
     # 入口: bestcf CSV + 内置优选域名; 可用 HOSTS_ENTRY 覆盖(逗号分隔)
     _entry = os.environ.get("HOSTS_ENTRY", "").strip()
@@ -1396,7 +1391,7 @@ def build_hosts_text(data):
             if MAX_LATENCY_MS > 0
             else "# 网络延迟 = 入口实测延迟 (不限)"
         ),
-        "# 名字 = 国家-住宅候选/机房-编号; 住宅候选由出口 IP 情报判定",
+        "# 名字 = 国家-住宅/机房-编号; 住宅机房混排, 编号按延迟从快到慢",
         "# 注意: VPN Gate 无法保证家庭宽带/原生 IP; 清单不把候选写成保证",
         "# 名字固定; 只有 $sstp:// 后面的节点地址每 30 分钟自动更换",
         "# 账号密码固定 vpn:vpn ; 节点端口必须保留",
@@ -1413,7 +1408,6 @@ def build_hosts_text(data):
         nodes = sorted(
             grp["nodes"],
             key=lambda n: (
-                0 if n.get("residential") == "residential" else 1,
                 n.get("latency_ms") is None,
                 n.get("latency_ms") or 0,
                 n.get("host") or "",
@@ -1424,9 +1418,8 @@ def build_hosts_text(data):
             f"# ---- {zh} {code} · {grp['count']} 节点 × {copies} 入口 = {int(grp['count']) * copies} 行"
             f" (住宅 {grp['residential']} / 机房 {grp['datacenter']}) ----"
         )
-        res_nodes = [n for n in nodes if n.get("residential") == "residential"]
-        dc_nodes = [n for n in nodes if n.get("residential") != "residential"]
-        for i, n in enumerate(res_nodes, 1):
+        for i, n in enumerate(nodes, 1):
+            kind = "住宅" if n.get("residential") == "residential" else "机房"
             assigned = n.get("entries") or []
             for c in range(copies):
                 if c < len(assigned):
@@ -1436,19 +1429,7 @@ def build_hosts_text(data):
                     idx += 1
                 suffix = "" if c == 0 else f"-{c + 1}"
                 lines.append(
-                    f"{entry}#{zh}-住宅-{i:02d}{suffix}$sstp://vpn:vpn@{n['host']}:{n['port']}"
-                )
-        for i, n in enumerate(dc_nodes, 1):
-            assigned = n.get("entries") or []
-            for c in range(copies):
-                if c < len(assigned):
-                    entry = assigned[c]
-                else:
-                    entry = edge[idx % len(edge)]
-                    idx += 1
-                suffix = "" if c == 0 else f"-{c + 1}"
-                lines.append(
-                    f"{entry}#{zh}-机房-{i:02d}{suffix}$sstp://vpn:vpn@{n['host']}:{n['port']}"
+                    f"{entry}#{zh}-{kind}-{i:02d}{suffix}$sstp://vpn:vpn@{n['host']}:{n['port']}"
                 )
     return "\n".join(lines) + "\n"
 
@@ -1517,7 +1498,6 @@ def build_sub_text(data):
         nodes = sorted(
             grp["nodes"],
             key=lambda n: (
-                0 if n.get("residential") == "residential" else 1,
                 n.get("latency_ms") is None,
                 n.get("latency_ms") or 0,
                 n.get("host") or "",
@@ -1638,7 +1618,10 @@ def main():
     # 4) 结果 + 网页
     data = build_outputs(results, raw_count, sstp_count, source)
     if MAX_LATENCY_MS > 0:
-        log("RESULT", f"延迟过滤: ≤ {MAX_LATENCY_MS}ms 保留, 丢弃 {data['stats']['slow_filtered']} 个")
+        log(
+            "RESULT",
+            f"延迟过滤: < {MAX_LATENCY_MS}ms 保留, 丢弃 {data['stats']['slow_filtered']} 个"
+        )
     if MAX_HANDSHAKE_MS > 0:
         log(
             "RESULT",
