@@ -745,6 +745,16 @@ def _latency_key(node):
     return (lat is None, lat if lat is not None else float("inf"), node.get("host") or "")
 
 
+def _host_class(node):
+    """按 VPN Gate 命名区分中继类型: 编号中继多为家宽, public-vpn/opengw 为托管中继。"""
+    host = (node.get("host") or "").lower()
+    if host.startswith(("public-vpn", "opengw")):
+        return "hosting"
+    if re.match(r"^(vpn\d{5,}|vpnv\d+)", host):
+        return "home"
+    return "other"
+
+
 def build_outputs(results, raw_count, sstp_count, source):
     def _num(value):
         try:
@@ -753,6 +763,15 @@ def build_outputs(results, raw_count, sstp_count, source):
             return None
 
     success = [r for r in results if r.get("success")]
+
+    # 源构成: 解释清单里住宅远多于机房的原因 (托管命名中继大多过不了 SSTP 检测)
+    class_checked = {"home": 0, "hosting": 0, "other": 0}
+    class_passed = {"home": 0, "hosting": 0, "other": 0}
+    for r in results:
+        cls = _host_class(r)
+        class_checked[cls] += 1
+        if r.get("success"):
+            class_passed[cls] += 1
 
     # 给每个节点分配优选入口域名 (hosts.txt 里同一节点会用到这几行)。
     # latency_ms = 入口实测延迟 (可比的"网络延迟"); setup_ms = SSTP 建链耗时。
@@ -912,6 +931,8 @@ def build_outputs(results, raw_count, sstp_count, source):
         "residential_note": (
             "住宅/机房都保留；不能保证家庭宽带或原生 IP。"
         ),
+        "source_mix": class_checked,
+        "source_mix_passed": class_passed,
         "purity_note": (
             "purity 来自 ip-api：默认要求 hosting=false 且 mobile=false；"
             "proxy 仅展示、不强制，因为 VPN Gate 出口常被标为 proxy/VPN。"
@@ -1669,6 +1690,14 @@ def main():
         )
     log("RESULT", f"可用节点: {data['stats']['success']}")
     log("RESULT", f"国家数量: {data['stats']['countries']}")
+    mix = data["stats"]["source_mix"]
+    mix_ok = data["stats"]["source_mix_passed"]
+    log(
+        "RESULT",
+        f"源构成: 家宽命名 {mix['home']} 个 (可用 {mix_ok['home']}) / "
+        f"托管命名 {mix['hosting']} 个 (可用 {mix_ok['hosting']}) / "
+        f"其它 {mix['other']} 个 (可用 {mix_ok['other']})",
+    )
 
     data_path, html_path, chains_path, hosts_path, sub_path = write_outputs(data)
     log("WEBSITE", f"生成 {os.path.relpath(data_path, REPO_DIR)}")
